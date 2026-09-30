@@ -88,7 +88,7 @@ optdepends=(
 provides=()
 conflicts=()
 
-source=("$pkgname::git+@GITHUB_CLONE_URL@#commit=${_commit}")
+source=("sunshine::git+file:///home/solidv/GitHub/Sunshine")
 sha256sums=('SKIP')
 
 # Options Handling
