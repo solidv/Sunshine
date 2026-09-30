@@ -2191,6 +2191,41 @@ consent prompt for directory ACLs, so the Web UI shows setup steps for correctin
     </tr>
 </table>
 
+### pyrowave_mode
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Allows the client to request PyroWave, a GPU wavelet (intra-only) video codec for
+            low-latency local streaming.
+            @note{Requires a PyroWave-enabled build, a Vulkan 1.3 GPU, and a DMA-BUF capture path
+            (set @code{}encoder = vulkan@endcode). Applies to Linux only.}
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            0
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            pyrowave_mode = 2
+            @endcode</td>
+    </tr>
+    <tr>
+        <td rowspan="2">Choices</td>
+        <td>0</td>
+        <td>do not advertise support for PyroWave</td>
+    </tr>
+    <tr>
+        <td>2</td>
+        <td>advertise support for PyroWave</td>
+    </tr>
+</table>
+
 ### capture
 
 <table>

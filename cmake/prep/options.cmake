@@ -64,6 +64,9 @@ elseif(UNIX)  # Linux
             "Enable building vaapi specific code." ON)
     option(SUNSHINE_ENABLE_VULKAN
             "Enable Vulkan video encoding." ON)
+    option(SUNSHINE_ENABLE_PYROWAVE
+            "Enable PyroWave (Vulkan wavelet) video encoding. Requires SUNSHINE_ENABLE_VULKAN and the
+        third-party/pyrowave submodule, built per cmake/dependencies/pyrowave.cmake." OFF)
     option(SUNSHINE_ENABLE_WAYLAND
             "Enable building wayland specific code." ON)
     option(SUNSHINE_ENABLE_X11

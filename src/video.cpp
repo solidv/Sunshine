@@ -36,6 +36,11 @@ extern "C" {
 #include "sync.h"
 #include "video.h"
 
+#ifdef SUNSHINE_ENABLE_PYROWAVE
+  // PyroWave encoding is only implemented on Linux; the corresponding CMake option is Linux-only.
+  #include "platform/linux/pyrowave_encode.h"
+#endif
+
 #ifdef _WIN32
 extern "C" {
   #include <libavutil/hwcontext_d3d11va.h>
@@ -1470,6 +1475,7 @@ namespace video {
   static encoder_t *chosen_encoder;
   int active_hevc_mode;  ///< HEVC mode selected by the most recent encoder probe.
   int active_av1_mode;  ///< AV1 mode selected by the most recent encoder probe.
+  int active_pyrowave_mode;  ///< PyroWave mode selected by the most recent encoder probe.
   bool last_encoder_probe_supported_ref_frames_invalidation = false;  ///< Whether the last probe found reference-frame invalidation support.
   std::array<bool, 3> last_encoder_probe_supported_yuv444_for_codec = {};  ///< YUV444 support discovered for each probed codec.
 
@@ -2511,6 +2517,130 @@ namespace video {
     }
   }
 
+#ifdef SUNSHINE_ENABLE_PYROWAVE
+  /**
+   * @brief Consecutive PyroWave encode failures tolerated before the stream is abandoned.
+   *
+   * Roughly a few seconds at stream framerates: long enough to cover frames captured before the
+   * first DMA-BUF frame arrives, short enough to end a stream whose capture path can never
+   * produce importable frames instead of logging at frame rate forever.
+   */
+  constexpr size_t MAX_ENCODE_FAILURES = 100;
+
+  /**
+   * @brief Asynchronous capture/encode loop for the PyroWave codec.
+   *
+   * PyroWave does not use the encoder_t / encode_device abstraction: this loop captures frames and
+   * drives platf::pyrowave::encoder_t directly, emitting packet_raw_generic. PyroWave is intra-only,
+   * so every frame is an IDR and reference-frame invalidation / IDR requests are no-ops.
+   *
+   * @param frame_nr Frame counter updated as frames are encoded.
+   * @param mail Session mail bus.
+   * @param images Captured image event source.
+   * @param config Video configuration.
+   * @param disp Display being encoded.
+   * @param reinit_event Signal raised while the display is reinitializing.
+   * @param channel_data Opaque channel data passed to packets.
+   */
+  void encode_run_pyrowave(
+    int &frame_nr,
+    safe::mail_t mail,
+    img_event_t images,
+    config_t config,
+    std::shared_ptr<platf::display_t> disp,
+    safe::signal_t &reinit_event,
+    void *channel_data
+  ) {
+    // 10-bit (R16) plane containers whenever a 10-bit profile was negotiated; the HDR color math
+    // additionally requires the display to actually be in HDR mode (else SDR content is carried in
+    // the 10-bit containers and the client presents it as SDR).
+    bool ten_bit = config.dynamicRange == 1;
+    auto encoder = platf::pyrowave::encoder_t::create(config.width, config.height, config.bitrate, config.framerate, config.chromaSamplingType == 1, ten_bit, ten_bit && disp->is_hdr());
+    if (!encoder) {
+      BOOST_LOG(error) << "Failed to create PyroWave encoder"sv;
+      return;
+    }
+
+    double minimum_fps_target = (config::video.minimum_fps_target > 0.0) ? config::video.minimum_fps_target : (config.framerate / 2.0);
+    if (!(minimum_fps_target > 0.0)) {
+      minimum_fps_target = 30.0;  // guard against framerate==0 -> infinite/NaN frametime
+    }
+    std::chrono::duration<double, std::milli> max_frametime {1000.0 / minimum_fps_target};
+
+    auto shutdown_event = mail->event<bool>(mail::shutdown);
+    auto packets = mail::man->queue<packet_t>(mail::video_packets);
+    auto idr_events = mail->event<bool>(mail::idr);
+    auto invalidate_ref_frames_events = mail->event<std::pair<int64_t, int64_t>>(mail::invalidate_ref_frames);
+
+    // Prime with a black dummy frame so we always have something to encode, even before the first
+    // captured frame arrives and when the desktop is static (variable-rate capture only delivers a
+    // frame on change). We re-encode the most recent frame every tick, matching the minimum-FPS
+    // behavior of the normal encode loop. PyroWave is intra-only, so every frame stands alone.
+    auto last_img = disp->alloc_img();
+    if (!last_img || disp->dummy_img(last_img.get())) {
+      BOOST_LOG(error) << "PyroWave: failed to allocate initial image"sv;
+      return;
+    }
+
+    bool logged_first = false;
+    size_t consecutive_failures = 0;
+    while (true) {
+      // Drain control events — no-ops for an intra-only codec, but must not accumulate.
+      while (invalidate_ref_frames_events->peek()) {
+        invalidate_ref_frames_events->pop(0ms);
+      }
+      if (idr_events->peek()) {
+        idr_events->pop();
+      }
+
+      std::optional<std::chrono::steady_clock::time_point> frame_timestamp;
+      bool captured_frame = false;
+      if (auto img = images->pop(max_frametime)) {
+        frame_timestamp = img->frame_timestamp;
+        last_img = img;
+        captured_frame = true;
+      } else if (!images->running()) {
+        break;
+      }
+
+      if (shutdown_event->peek() || !images->running() || (reinit_event.peek() && frame_nr > 1)) {
+        break;
+      }
+
+      std::vector<uint8_t> bitstream;
+      size_t fec_head_bytes = 0;
+      if (encoder->encode(*last_img, bitstream, fec_head_bytes)) {
+        // Drop this frame rather than tearing down the stream (e.g. a transient/non-CPU frame).
+        // Only captured frames say anything about the capture path: the priming dummy frame is
+        // expected to be unencodable until the first capture arrives. A capture path that can
+        // never produce importable frames (which the encoder probe could not rule out) would
+        // otherwise fail on every tick, so give up on it instead of logging at frame rate until
+        // the client disconnects.
+        if (captured_frame && ++consecutive_failures >= MAX_ENCODE_FAILURES) {
+          BOOST_LOG(error) << "PyroWave: giving up after "sv << consecutive_failures << " consecutive encode failures"sv;
+          return;
+        }
+        continue;
+      }
+      consecutive_failures = 0;
+
+      if (!logged_first) {
+        BOOST_LOG(info) << "PyroWave: first encoded frame " << bitstream.size() << " bytes"sv;
+        logged_first = true;
+      }
+
+      auto packet = std::make_unique<packet_raw_generic>(std::move(bitstream), (int64_t) frame_nr, true);
+      packet->channel_data = channel_data;
+      packet->frame_timestamp = frame_timestamp;
+      packet->fec_head_bytes = fec_head_bytes;
+      packets->raise(std::move(packet));
+      frame_nr++;
+
+      platf::enable_mouse_keys();
+    }
+  }
+#endif  // SUNSHINE_ENABLE_PYROWAVE
+
   /**
    * @brief Create a port object or message.
    *
@@ -2866,6 +2996,23 @@ namespace video {
   }
 
   /**
+   * @brief Report whether a client configuration selects the PyroWave codec.
+   *
+   * Always false when PyroWave support was not compiled in.
+   *
+   * @param config Configuration values to apply.
+   * @return True when the client requested PyroWave.
+   */
+  bool is_pyrowave_config(const config_t &config) {
+#ifdef SUNSHINE_ENABLE_PYROWAVE
+    return config.videoFormat == PYROWAVE_BITSTREAM_FORMAT;
+#else
+    (void) config;
+    return false;
+#endif
+  }
+
+  /**
    * @brief Capture and encode video using the asynchronous capture thread.
    *
    * @param mail Session mail bus.
@@ -2921,6 +3068,28 @@ namespace video {
         display = ref->display_wp->lock();
       }
 
+#ifdef SUNSHINE_ENABLE_PYROWAVE
+      if (is_pyrowave_config(config)) {
+        // PyroWave path: bypass the encoder_t / encode_device machinery entirely.
+        touch_port_event->raise(make_port(display.get(), config));
+
+        // HDR only when the client negotiated a 10-bit PyroWave profile AND the display is
+        // actually in HDR mode (same policy as make_encode_device's colorspace selection).
+        hdr_info_t hdr_info = std::make_unique<hdr_info_raw_t>(false);
+        if (config.dynamicRange && display->is_hdr()) {
+          if (display->get_hdr_metadata(hdr_info->metadata)) {
+            hdr_info->enabled = true;
+          } else {
+            BOOST_LOG(error) << "Couldn't get display hdr metadata when colorspace selection indicates it should have one";
+          }
+        }
+        hdr_event->raise(std::move(hdr_info));
+
+        encode_run_pyrowave(frame_nr, mail, images, config, display, ref->reinit_event, channel_data);
+        continue;
+      }
+#endif
+
       auto &encoder = *chosen_encoder;
 
       auto encode_device = make_encode_device(*display, encoder, config);
@@ -2968,12 +3137,18 @@ namespace video {
     config_t config,
     void *channel_data
   ) {
-    config = resolve_dynamic_range(*chosen_encoder, config);
+    // PyroWave encodes on its own Vulkan device and carries its own dynamic-range support, so the
+    // avcodec encoder capability probe must not downgrade the client's HDR request (PyroWave is
+    // not one of the codecs the probe knows about).
+    if (!is_pyrowave_config(config)) {
+      config = resolve_dynamic_range(*chosen_encoder, config);
+    }
 
     auto idr_events = mail->event<bool>(mail::idr);
 
     idr_events->raise(true);
-    if (chosen_encoder->flags & PARALLEL_ENCODING) {
+    // PyroWave always uses the async capture path (its dedicated loop lives in capture_async).
+    if ((chosen_encoder->flags & PARALLEL_ENCODING) || is_pyrowave_config(config)) {
       capture_async(std::move(mail), config, channel_data);
     } else {
       safe::signal_t join_event;
@@ -3281,6 +3456,18 @@ namespace video {
     chosen_encoder = nullptr;
     active_hevc_mode = config::video.hevc_mode;
     active_av1_mode = config::video.av1_mode;
+    // PyroWave is a standalone Vulkan path that does not ride the avcodec encoder probe below.
+    // It is only advertised when explicitly enabled (mode >= 2), compiled in, and its Vulkan
+    // device validates. Otherwise it is forced off so existing codecs are unaffected.
+    active_pyrowave_mode = config::video.pyrowave_mode;
+#ifdef SUNSHINE_ENABLE_PYROWAVE
+    if (active_pyrowave_mode >= 2 && !platf::pyrowave::validate()) {
+      BOOST_LOG(warning) << "PyroWave is enabled but no compatible Vulkan device was found; disabling PyroWave"sv;
+      active_pyrowave_mode = 0;
+    }
+#else
+    active_pyrowave_mode = 0;
+#endif
     last_encoder_probe_supported_ref_frames_invalidation = false;
 
     auto adjust_encoder_constraints_hevc = [&](encoder_t *encoder) {
@@ -3430,6 +3617,14 @@ namespace video {
     BOOST_LOG(info);
 
     auto &encoder = *chosen_encoder;
+
+    // PyroWave consumes the captured DMA-BUF directly, so it needs a capture path that hands the
+    // encoder GPU images. Encoders that take system-memory frames (e.g. software, or the X11
+    // capture path) can never feed it, so don't advertise a codec that would fail on every frame.
+    if (active_pyrowave_mode >= 2 && encoder.platform_formats->dev_type == platf::mem_type_e::system) {
+      BOOST_LOG(warning) << "PyroWave requires a GPU (DMA-BUF) capture path, but encoder ["sv << encoder.name << "] uses system memory; disabling PyroWave"sv;
+      active_pyrowave_mode = 0;
+    }
 
     last_encoder_probe_supported_ref_frames_invalidation = (encoder.flags & REF_FRAMES_INVALIDATION);
     last_encoder_probe_supported_yuv444_for_codec[0] = encoder.h264[encoder_t::PASSED] &&

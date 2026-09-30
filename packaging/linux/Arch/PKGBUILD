@@ -5,6 +5,7 @@
 : "${_run_unit_tests:=false}"  # if set to true; unit tests will be executed post build; useful in CI
 : "${_support_headless_testing:=false}"
 : "${_use_cuda:=detect}" # nvenc
+: "${_enable_pyrowave:=true}" # builds the bundled PyroWave (Vulkan wavelet) encoder; needs network access while building
 
 : "${_commit:=@GITHUB_COMMIT@}"
 
@@ -70,6 +71,7 @@ makedepends=(
   'make'
   'nodejs'
   'npm'
+  'patchelf'  # strips the PyroWave build-tree RUNPATH from the installed binary
   'python-jinja'  # required by the glad OpenGL/EGL loader generator
   'shaderc'
 )
@@ -173,6 +175,28 @@ build() {
       _cmake_options+=(-DBUILD_TESTS=OFF)
     fi
 
+    if [[ "${_enable_pyrowave::1}" == "t" ]]; then
+      if [[ ! -f "$pkgname/third-party/pyrowave/CMakeLists.txt" ]]; then
+        echo "PyroWave was requested, but third-party/pyrowave is missing from the source tree." >&2
+        echo "Make sure the submodule is committed and initialized, or build with _enable_pyrowave=false." >&2
+        return 1
+      fi
+
+      _cmake_options+=(-DSUNSHINE_ENABLE_PYROWAVE=ON)
+
+      # PyroWave is not a distribution package, so build the bundled codec library first:
+      # cmake/dependencies/pyrowave.cmake requires it to exist before Sunshine is configured and
+      # links it as a shared library, so that its bundled volk cannot shadow the system Vulkan
+      # loader. checkout_granite.sh fetches the pinned Granite revision plus the volk and
+      # Vulkan-Headers submodules Granite builds against, so this step needs network access.
+      (
+        cd "$pkgname/third-party/pyrowave"
+        ./checkout_granite.sh
+        cmake -S . -B build -Wno-dev -D CMAKE_BUILD_TYPE=Release
+        cmake --build build
+      )
+    fi
+
     if [[ -z "${GITHUB_ACTIONS}" ]]; then
 	    _appstreamcli_arguments=(--no-net)
     fi
@@ -249,4 +273,24 @@ check() {
 package() {
     export MAKEFLAGS="${MAKEFLAGS:--j$(nproc)}"
     DESTDIR="$pkgdir" cmake --install build
+
+    if [[ "${_enable_pyrowave::1}" == "t" ]]; then
+      # The codec library Sunshine links against for PyroWave is not a distribution package, so it
+      # ships with this one.
+      local _pyrowave_lib _pyrowave_soname
+      _pyrowave_lib="$(find "${srcdir}/${pkgname}/third-party/pyrowave/build" -maxdepth 1 -name 'libpyrowave-shared.so.*.*.*' -print -quit)"
+
+      if [[ -z "${_pyrowave_lib}" ]]; then
+        echo "PyroWave shared library was not built" >&2
+        return 1
+      fi
+
+      _pyrowave_soname="$(basename "${_pyrowave_lib}")"
+      install -Dm755 "${_pyrowave_lib}" "${pkgdir}/usr/lib/${_pyrowave_soname}"
+      ln -sf "${_pyrowave_soname}" "${pkgdir}/usr/lib/libpyrowave-shared.so.0"
+
+      # Drop the development RUNPATH that points into the build tree; the library now lives in a
+      # default loader search path.
+      patchelf --remove-rpath "${pkgdir}/usr/bin/sunshine"
+    fi
 }

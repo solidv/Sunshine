@@ -21,6 +21,26 @@ extern "C" {
 
 struct AVPacket;
 
+/**
+ * @brief PyroWave codec-mode bits reported in the GameStream `ServerCodecModeSupport` field.
+ *
+ * PyroWave is a Sunshine/Moonlight protocol extension, so these bits are not part of upstream
+ * moonlight-common-c yet. The values match the client-side implementation and the guards keep
+ * them harmless once the submodule provides the definitions itself.
+ */
+#ifndef SCM_PYROWAVE
+  #define SCM_PYROWAVE 0x00800000  ///< PyroWave 4:2:0 8-bit.
+#endif
+#ifndef SCM_PYROWAVE_444
+  #define SCM_PYROWAVE_444 0x01000000  ///< PyroWave 4:4:4 8-bit.
+#endif
+#ifndef SCM_PYROWAVE10_420
+  #define SCM_PYROWAVE10_420 0x02000000  ///< PyroWave 4:2:0 10-bit.
+#endif
+#ifndef SCM_PYROWAVE10_444
+  #define SCM_PYROWAVE10_444 0x04000000  ///< PyroWave 4:4:4 10-bit.
+#endif
+
 namespace video {
 
   /**
@@ -35,11 +55,16 @@ namespace video {
     int slicesPerFrame;  ///< Number of slices per frame.
     int numRefFrames;  ///< Maximum number of reference frames.
     int encoderCscMode;  ///< Requested color range and SDR colorspace; HDR always uses BT.2020 and ST2084.
-    int videoFormat;  ///< Video codec format: 0 = H.264, 1 = HEVC, 2 = AV1.
+    int videoFormat;  ///< Video codec format: 0 = H.264, 1 = HEVC, 2 = AV1, 3 = PyroWave.
     int dynamicRange;  ///< Encoding color depth: 0 = 8-bit, 1 = 10-bit.
     int chromaSamplingType;  ///< Chroma sampling type: 0 = 4:2:0, 1 = 4:4:4.
     int enableIntraRefresh;  ///< Intra refresh setting: 0 = disabled, 1 = enabled.
   };
+
+  /**
+   * @brief `x-nv-vqos[0].bitStreamFormat` value a client sends to request PyroWave.
+   */
+  constexpr int PYROWAVE_BITSTREAM_FORMAT = 3;
 
   namespace amf {
 
@@ -531,6 +556,18 @@ namespace video {
     void *channel_data = nullptr;  ///< Platform or protocol state carried with this packet.
     bool after_ref_frame_invalidation = false;  ///< Whether the frame follows reference-frame invalidation.
     std::optional<std::chrono::steady_clock::time_point> frame_timestamp;  ///< Capture timestamp associated with the frame.
+
+    /**
+     * @brief Byte offset where the payload's loss-critical head ends, or 0 for none.
+     *
+     * Only produced by codecs whose bitstream is ordered most-important-first (PyroWave, which
+     * emits coarse wavelet levels before fine ones). The RTP layer cuts the frame's FEC blocks at
+     * this boundary and protects only `[0, fec_head_bytes)` with Reed-Solomon parity — loss in the
+     * head is catastrophic, while the bare tail degrades to blur that the client's partial-frame
+     * delivery can still show. 0 (every other codec, or a frame too small to split) keeps the
+     * normal even split at the configured FEC percentage.
+     */
+    size_t fec_head_bytes = 0;
   };
 
   /**
@@ -680,6 +717,7 @@ namespace video {
 
   extern int active_hevc_mode;
   extern int active_av1_mode;
+  extern int active_pyrowave_mode;
   extern bool last_encoder_probe_supported_ref_frames_invalidation;
   extern std::array<bool, 3> last_encoder_probe_supported_yuv444_for_codec;  // 0 - H.264, 1 - HEVC, 2 - AV1
 
