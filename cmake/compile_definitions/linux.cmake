@@ -197,6 +197,19 @@ if(${SUNSHINE_ENABLE_VULKAN})
     set(SUNSHINE_TARGET_DEPENDENCIES ${SUNSHINE_TARGET_DEPENDENCIES} vulkan_shaders)
 endif()
 
+# pyrowave (Vulkan wavelet codec)
+if(${SUNSHINE_ENABLE_PYROWAVE})
+    if(NOT ${SUNSHINE_ENABLE_VULKAN})
+        message(FATAL_ERROR "SUNSHINE_ENABLE_PYROWAVE requires SUNSHINE_ENABLE_VULKAN")
+    endif()
+    include(dependencies/pyrowave)
+    list(APPEND SUNSHINE_DEFINITIONS SUNSHINE_ENABLE_PYROWAVE=1)
+    list(APPEND PLATFORM_LIBRARIES ${PYROWAVE_LIBRARIES})
+    list(APPEND PLATFORM_TARGET_FILES
+            "${CMAKE_SOURCE_DIR}/src/platform/linux/pyrowave_encode.h"
+            "${CMAKE_SOURCE_DIR}/src/platform/linux/pyrowave_encode.cpp")
+endif()
+
 # wayland
 if(${SUNSHINE_ENABLE_WAYLAND})
     find_package(Wayland REQUIRED)

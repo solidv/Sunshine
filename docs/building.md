@@ -247,6 +247,26 @@ ninja -C build
 > Available build options can be found in
 > [options.cmake](https://github.com/LizardByte/Sunshine/blob/master/cmake/prep/options.cmake).
 
+### PyroWave Encoding (Optional)
+
+PyroWave is an intra-only GPU wavelet codec intended for low-latency streaming over high-bandwidth
+local networks. It is disabled by default. To build it on Linux, first build the vendored PyroWave
+shared library (it fetches Granite itself), then configure Sunshine with
+`-DSUNSHINE_ENABLE_PYROWAVE=ON`:
+
+```bash
+git submodule update --init third-party/pyrowave
+cd third-party/pyrowave
+./checkout_granite.sh
+cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+cmake --build build
+cd ../..
+cmake -B build -G Ninja -S . -DSUNSHINE_ENABLE_PYROWAVE=ON
+```
+
+PyroWave requires a Vulkan 1.3 GPU, `SUNSHINE_ENABLE_VULKAN` (on by default), and a DMA-BUF capture
+path at runtime, so it must be used with `encoder = vulkan`.
+
 ### Package
 
 @tabs_grouped{platform|:|

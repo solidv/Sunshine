@@ -58,6 +58,16 @@ const config = ref(props.config)
       <div class="form-text">{{ $t('config.av1_mode_desc') }}</div>
     </div>
 
+    <!-- PyroWave Support -->
+    <div class="mb-3">
+      <label for="pyrowave_mode" class="form-label">{{ $t('config.pyrowave_mode') }}</label>
+      <select id="pyrowave_mode" class="form-select" v-model="config.pyrowave_mode">
+        <option value="0">{{ $t('config.pyrowave_mode_0') }}</option>
+        <option value="2">{{ $t('config.pyrowave_mode_2') }}</option>
+      </select>
+      <div class="form-text">{{ $t('config.pyrowave_mode_desc') }}</div>
+    </div>
+
     <!-- Capture -->
     <div class="mb-3" v-if="platform !== 'macos'">
       <label for="capture" class="form-label">{{ $t('config.capture') }}</label>

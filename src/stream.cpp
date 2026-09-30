@@ -922,6 +922,84 @@ namespace stream {
   }  // namespace fec
 
   /**
+   * @brief Reed-Solomon percentage applied to the loss-critical head of an importance-ordered frame.
+   *
+   * Used only for frames that report `fec_head_bytes` (PyroWave). The head — the sequence header
+   * plus the coarsest wavelet levels, roughly 20% of a real frame's bytes — gets this fixed parity
+   * and the tail gets none, so total overhead lands near 10% while head loss (the catastrophic
+   * case) stays nearly impossible. Loss in the bare tail truncates the frame at the hole, which
+   * the client's partial-frame delivery renders as slight blur. Measured against uniform 20% FEC
+   * on real 4K captures this halves the overhead while lowering the dropped-frame rate.
+   */
+  constexpr int FEC_HEAD_PERCENTAGE = 50;
+
+  /**
+   * @brief Split an importance-ordered frame into a protected head block and bare tail blocks.
+   *
+   * Cuts FEC block 0 to cover the first `head_stream_bytes` of the pre-sliced payload (rounded up
+   * to whole packets, so a straddling packet stays in the head) at #FEC_HEAD_PERCENTAGE parity;
+   * the remaining packets are split evenly into blocks with 0% parity, each within the
+   * Reed-Solomon shard cap.
+   *
+   * @param payload The frame payload, already sliced into `blocksize` packets with header space.
+   * @param blocksize Bytes per packet including the RTP/video header.
+   * @param payload_blocksize Video payload bytes per packet.
+   * @param head_stream_bytes Prefix of the *unsliced* stream (frame header + DU bytes) to protect.
+   * @param blocks Receives one string_view per FEC block.
+   * @param percentages Receives the FEC percentage for each block.
+   * @return The number of FEC blocks, or 0 when the split does not apply (head empty, frame has
+   *         no tail, or a limit would be exceeded) and the caller should fall back to the even
+   *         split at the configured percentage.
+   */
+  int split_fec_blocks_head_tail(const std::string_view &payload, size_t blocksize, size_t payload_blocksize, size_t head_stream_bytes, std::array<std::string_view, 4> &blocks, std::array<int, 4> &percentages) {
+    // There are 2 bits for FEC block count for a maximum of 4 FEC blocks
+    constexpr int MAX_FEC_BLOCKS = 4;
+    static_assert(sizeof(blocks) == MAX_FEC_BLOCKS * sizeof(std::string_view));
+
+    const size_t total_packets = (payload.size() + blocksize - 1) / blocksize;
+    const size_t head_packets = (head_stream_bytes + payload_blocksize - 1) / payload_blocksize;
+    if (head_packets == 0 || head_packets >= total_packets) {
+      return 0;
+    }
+
+    // The protected block must fit data + parity in the Reed-Solomon shard limit.
+    if (head_packets > (size_t) (DATA_SHARDS_MAX * 100) / (100 + FEC_HEAD_PERCENTAGE)) {
+      return 0;
+    }
+
+    // Bare blocks never run Reed-Solomon, but stay within the shard limit anyway so every field
+    // and client-side assumption sees values the even split could have produced.
+    const size_t tail_packets = total_packets - head_packets;
+    const int tail_blocks = (int) ((tail_packets + DATA_SHARDS_MAX - 1) / DATA_SHARDS_MAX);
+    if (1 + tail_blocks > MAX_FEC_BLOCKS) {
+      return 0;
+    }
+
+    blocks[0] = payload.substr(0, head_packets * blocksize);
+    percentages[0] = FEC_HEAD_PERCENTAGE;
+
+    const size_t tail_base = tail_packets / tail_blocks;
+    size_t tail_extra = tail_packets % tail_blocks;
+    size_t offset = head_packets * blocksize;
+    for (int x = 0; x < tail_blocks; ++x) {
+      const size_t block_packets = tail_base + (tail_extra > 0 ? 1 : 0);
+      if (tail_extra > 0) {
+        --tail_extra;
+      }
+      if (x == tail_blocks - 1) {
+        // The last block must extend to the end of the payload
+        blocks[1 + x] = payload.substr(offset);
+      } else {
+        blocks[1 + x] = payload.substr(offset, block_packets * blocksize);
+      }
+      percentages[1 + x] = 0;
+      offset += block_packets * blocksize;
+    }
+
+    return 1 + tail_blocks;
+  }
+
+  /**
    * @brief Combines two buffers and inserts new buffers at each slice boundary of the result.
    * @param insert_size The number of bytes to insert.
    * @param slice_size The number of bytes between insertions.
@@ -1607,53 +1685,68 @@ namespace stream {
       // There are 2 bits for FEC block count for a maximum of 4 FEC blocks
       constexpr auto MAX_FEC_BLOCKS = 4;
 
-      // The max number of data shards per block is found by solving this system of equations for D:
-      // D = 255 - P
-      // P = D * F
-      // which results in the solution:
-      // D = 255 / (1 + F)
-      // multiplied by 100 since F is the percentage as an integer:
-      // D = (255 * 100) / (100 + F)
-      auto max_data_shards_per_fec_block = (DATA_SHARDS_MAX * 100) / (100 + fecPercentage);
+      std::array<std::string_view, MAX_FEC_BLOCKS> fec_blocks;
+      std::array<int, MAX_FEC_BLOCKS> block_fec_percentages;
+      size_t fec_blocks_needed = 0;
 
-      // Compute the number of FEC blocks needed for this frame using the block size and max shards
-      auto max_data_per_fec_block = max_data_shards_per_fec_block * blocksize;
-      auto fec_blocks_needed = (payload.size() + (max_data_per_fec_block - 1)) / max_data_per_fec_block;
-
-      // If the number of FEC blocks needed exceeds the protocol limit, turn off FEC for this frame.
-      // For normal FEC percentages, this should only happen for enormous frames (over 800 packets at 20%).
-      if (fec_blocks_needed > MAX_FEC_BLOCKS) {
-        BOOST_LOG(warning) << "Skipping FEC for abnormally large encoded frame (needed "sv << fec_blocks_needed << " FEC blocks)"sv;
-        fecPercentage = 0;
-        fec_blocks_needed = MAX_FEC_BLOCKS;
+      // Importance-ordered codecs (PyroWave) report where the frame's loss-critical head ends.
+      // Protect exactly that prefix with heavy parity and leave the tail bare, instead of
+      // spreading the configured percentage evenly. The frame header rides ahead of the DU
+      // bytes in the sliced payload, so it extends the protected prefix.
+      if (packet->fec_head_bytes > 0) {
+        fec_blocks_needed = split_fec_blocks_head_tail(payload, blocksize, payload_blocksize, packet->fec_head_bytes + sizeof(frame_header), fec_blocks, block_fec_percentages);
       }
 
-      std::array<std::string_view, MAX_FEC_BLOCKS> fec_blocks;
+      if (fec_blocks_needed == 0) {
+        // The max number of data shards per block is found by solving this system of equations for D:
+        // D = 255 - P
+        // P = D * F
+        // which results in the solution:
+        // D = 255 / (1 + F)
+        // multiplied by 100 since F is the percentage as an integer:
+        // D = (255 * 100) / (100 + F)
+        auto max_data_shards_per_fec_block = (DATA_SHARDS_MAX * 100) / (100 + fecPercentage);
+
+        // Compute the number of FEC blocks needed for this frame using the block size and max shards
+        auto max_data_per_fec_block = max_data_shards_per_fec_block * blocksize;
+        fec_blocks_needed = (payload.size() + (max_data_per_fec_block - 1)) / max_data_per_fec_block;
+
+        // If the number of FEC blocks needed exceeds the protocol limit, turn off FEC for this frame.
+        // For normal FEC percentages, this should only happen for enormous frames (over 800 packets at 20%).
+        if (fec_blocks_needed > MAX_FEC_BLOCKS) {
+          BOOST_LOG(warning) << "Skipping FEC for abnormally large encoded frame (needed "sv << fec_blocks_needed << " FEC blocks)"sv;
+          fecPercentage = 0;
+          fec_blocks_needed = MAX_FEC_BLOCKS;
+        }
+
+        // Align individual FEC blocks to blocksize
+        auto unaligned_size = payload.size() / fec_blocks_needed;
+        auto aligned_size = ((unaligned_size + (blocksize - 1)) / blocksize) * blocksize;
+
+        // If we exceed the 10-bit FEC packet index (which means our frame exceeded 4096 packets),
+        // the frame will be unrecoverable. Log an error for this case.
+        if (aligned_size / blocksize >= 1024) {
+          BOOST_LOG(error) << "Encoder produced a frame too large to send! Is the encoder broken? (needed "sv << (aligned_size / blocksize) << " packets)"sv;
+        }
+
+        // Split the data into aligned FEC blocks
+        for (int x = 0; x < fec_blocks_needed; ++x) {
+          if (x == fec_blocks_needed - 1) {
+            // The last block must extend to the end of the payload
+            fec_blocks[x] = payload.substr(x * aligned_size);
+          } else {
+            // Earlier blocks just extend to the next block offset
+            fec_blocks[x] = payload.substr(x * aligned_size, aligned_size);
+          }
+        }
+
+        block_fec_percentages.fill(fecPercentage);
+      }
+
       auto fec_blocks_begin = std::begin(fec_blocks);
       auto fec_blocks_end = std::begin(fec_blocks) + fec_blocks_needed;
 
       BOOST_LOG(verbose) << "Generating "sv << fec_blocks_needed << " FEC blocks"sv;
-
-      // Align individual FEC blocks to blocksize
-      auto unaligned_size = payload.size() / fec_blocks_needed;
-      auto aligned_size = ((unaligned_size + (blocksize - 1)) / blocksize) * blocksize;
-
-      // If we exceed the 10-bit FEC packet index (which means our frame exceeded 4096 packets),
-      // the frame will be unrecoverable. Log an error for this case.
-      if (aligned_size / blocksize >= 1024) {
-        BOOST_LOG(error) << "Encoder produced a frame too large to send! Is the encoder broken? (needed "sv << (aligned_size / blocksize) << " packets)"sv;
-      }
-
-      // Split the data into aligned FEC blocks
-      for (int x = 0; x < fec_blocks_needed; ++x) {
-        if (x == fec_blocks_needed - 1) {
-          // The last block must extend to the end of the payload
-          fec_blocks[x] = payload.substr(x * aligned_size);
-        } else {
-          // Earlier blocks just extend to the next block offset
-          fec_blocks[x] = payload.substr(x * aligned_size, aligned_size);
-        }
-      }
 
       try {
         // Use around 80% of 1Gbps          1Gbps            percent    ms     packet      byte
@@ -1699,8 +1792,10 @@ namespace stream {
           }
 
           frame_fec_latency_logger.first_point_now();
-          // If video encryption is enabled, we allocate space for the encryption header before each shard
-          auto shards = fec::encode(current_payload, blocksize, fecPercentage, session->config.minRequiredFecPackets, session->video.cipher ? sizeof(video_packet_enc_prefix_t) : 0);
+          // If video encryption is enabled, we allocate space for the encryption header before each shard.
+          // Blocks carry individual FEC percentages (identical under the even split); the client
+          // re-reads fecInfo at every block transition, so this needs no protocol change.
+          auto shards = fec::encode(current_payload, blocksize, block_fec_percentages[blockIndex], session->config.minRequiredFecPackets, session->video.cipher ? sizeof(video_packet_enc_prefix_t) : 0);
           frame_fec_latency_logger.second_point_now_and_log();
 
           auto peer_address = session->video.peer.address();
