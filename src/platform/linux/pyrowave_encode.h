@@ -6,7 +6,13 @@
  * device and emits an already-packetized byte bitstream that Sunshine ships as packet_raw_generic.
  * Captured DMA-BUF frames are imported into PyroWave's Vulkan device and fed straight to its GPU
  * scaler/encoder, which converts RGB->YUV and scales into the stream resolution in a single pass,
- * so the codec requires a DMA-BUF capture (the `vulkan` capture/encode backend).
+ * so the codec requires a DMA-BUF capture (the `vulkan` capture/encode backend). Captures go
+ * through PyroWave's external image API (no per-frame CPU import submission), with a manual linear
+ * import as fallback when PyroWave is not on an async-compute queue.
+ *
+ * The device is pinned to Sunshine's capture GPU (matched by render node) so the DMA-BUF is
+ * imported on the GPU that produced it, and a high-priority queue is requested to keep encode
+ * latency low while the game saturates the GPU.
  *
  * The whole translation unit is compiled only when SUNSHINE_ENABLE_PYROWAVE is defined.
  */
@@ -51,21 +57,37 @@ namespace platf::pyrowave {
   crop_rect_t compute_crop_rect(int src_width, int src_height, int width, int height);
 
   /**
-   * @brief Probe for a PyroWave-capable Vulkan device.
+   * @brief Start the privileged worker that creates PyroWave devices.
    *
-   * Creates a throwaway Vulkan 1.3 instance and checks the compute features PyroWave's encoder
-   * requires (subgroup size control, shaderInt16, storageBuffer8BitAccess). Cheap enough to call
-   * from the encoder-probe path; the result gates whether SCM_PYROWAVE is advertised.
+   * Linux only grants queue priorities above medium to a caller with CAP_SYS_NICE (or root), and
+   * capabilities are per-thread. This must be called while the process still holds the capability,
+   * i.e. during startup before the engine drops its privileges; the worker then keeps it and
+   * creates each session's PyroWave device on request. Safe to call more than once.
+   */
+  void ensure_privileged_device_worker_started();
+
+  /**
+   * @brief Probe for a PyroWave-capable Vulkan device on Sunshine's capture GPU.
    *
-   * @return True when at least one physical device can run the PyroWave encoder.
+   * Creates a throwaway Vulkan 1.1 instance, matches the render node Sunshine captures from to a
+   * physical device (VK_EXT_physical_device_drm), and checks the compute features PyroWave's
+   * encoder requires (subgroup size control, shaderInt16, storageBuffer8BitAccess). When the
+   * render node cannot be matched, any device satisfies the probe, matching the encoder's
+   * default-device fallback. Cheap enough to call from the encoder-probe path; the result gates
+   * whether SCM_PYROWAVE is advertised.
+   *
+   * @return True when the capture GPU (or any device, when unmatched) can run the PyroWave encoder.
    */
   bool validate();
 
   /**
    * @brief One PyroWave encode session bound to a stream's width/height.
    *
-   * Owns a dedicated Vulkan device plus a pyrowave_encoder. Not thread-safe: the caller must
-   * serialize encode() calls, matching the pyrowave encoder contract.
+   * Owns a dedicated Vulkan device plus a pyrowave_encoder. The device is pinned to the capture
+   * GPU when its render node can be matched, and a high-priority queue is requested on the
+   * privileged worker (the granted priority may be lower when the OS or driver refuses).
+   * Not thread-safe: the caller must serialize encode() calls, matching the pyrowave encoder
+   * contract.
    */
   class encoder_t {
   public:

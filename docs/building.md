@@ -267,6 +267,12 @@ cmake -B build -G Ninja -S . -DSUNSHINE_ENABLE_PYROWAVE=ON
 PyroWave requires a Vulkan 1.3 GPU, `SUNSHINE_ENABLE_VULKAN` (on by default), and a DMA-BUF capture
 path at runtime, so it must be used with `encoder = vulkan`.
 
+PyroWave asks for a high GPU queue priority so the encode keeps its latency budget while a game
+saturates the GPU, and Linux only grants priorities above medium to a process with `CAP_SYS_NICE`.
+Packaged installs apply `cap_sys_admin,cap_sys_nice+p` to the binary; builds run directly from the
+build tree can apply `sudo setcap cap_sys_nice+p` to the Sunshine binary themselves. Without the
+capability PyroWave still works, but encodes compete with game GPU work at medium priority.
+
 ### Package
 
 @tabs_grouped{platform|:|

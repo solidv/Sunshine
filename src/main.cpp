@@ -21,6 +21,9 @@
   #include "platform/common.h"
   #include "platform/linux/graphics.h"
   #include "platform/linux/misc.h"
+  #if defined(SUNSHINE_ENABLE_PYROWAVE)
+    #include "platform/linux/pyrowave_encode.h"
+  #endif
 
   #include <sys/auxv.h>
 #endif
@@ -207,7 +210,7 @@ int main(int argc, char *argv[]) {
 #endif
 #if defined(__linux__)
   // On Linux, child threads inherit capabilities from the parent at creation time.
-  // We ensure the privileged worker starts while capabilities are still held,
+  // We ensure the privileged workers start while capabilities are still held,
   // and then immediately strip global privileges from the main thread and future tasks.
   // Please ensure that these calls remain ordered as early as possible in startup initialization.
   #if defined(SUNSHINE_BUILD_DRM)
@@ -220,6 +223,11 @@ int main(int argc, char *argv[]) {
 
   // Next, initialize privileged EGL worker thread
   egl::ensure_privileged_egl_worker_started();
+  #if defined(SUNSHINE_ENABLE_PYROWAVE)
+  // PyroWave needs CAP_SYS_NICE to request GPU queue priorities above medium, and the capability
+  // is per-thread: this worker keeps it after the main thread drops privileges.
+  platf::pyrowave::ensure_privileged_device_worker_started();
+  #endif
   // Finally, check and drop all capabilities via 'true', which includes CAP_SYS_NICE.
   if (platf::has_elevated_privileges(true)) {
     platf::drop_elevated_privileges(true);

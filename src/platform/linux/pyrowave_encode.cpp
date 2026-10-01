@@ -8,8 +8,26 @@
   // were included first, and clang-format would otherwise sort the quoted includes ahead of them.
   // clang-format off
   #include <array>
+  #include <cstring>
+  #include <functional>
+  #include <future>
+  #include <memory>
+  #include <stdexcept>
+  #include <string>
+  #include <thread>
+  #include <type_traits>
   #include <vector>
 
+  #include <pthread.h>
+  #include <signal.h>
+
+  #include <sys/stat.h>
+  #if defined(__FreeBSD__)
+    #include <sys/types.h>
+  #else
+    #include <sys/capability.h>
+    #include <sys/sysmacros.h>
+  #endif
   #include <unistd.h>
 
   #include <drm_fourcc.h>
@@ -193,6 +211,292 @@ namespace platf::pyrowave {
       return UINT32_MAX;
     }
 
+    /**
+     * @brief The physical device PyroWave should encode on, matched to Sunshine's capture GPU.
+     */
+    struct selected_gpu_t {
+      bool matched = false;  ///< True when the capture render node was matched to a Vulkan device.
+      bool usable = false;  ///< True when PyroWave can run on the matched device (or on any device when unmatched).
+      pyrowave_uuid uuid {};  ///< Device UUID of the matched device, used to pin PyroWave to it.
+      std::string name;  ///< Device name, for logging.
+    };
+
+    /**
+     * @brief Match Sunshine's capture render node to a PyroWave-capable physical device.
+     *
+     * PyroWave must encode on the same GPU that produced the captured DMA-BUF: on multi-GPU
+     * machines the default device may be the other one, and importing across GPUs fails or takes a
+     * slow path. The render node Sunshine captures from (`platf::resolve_render_device()`) is
+     * matched to a Vulkan device via VK_EXT_physical_device_drm, mirroring the Vulkan encoder.
+     * When no match can be made (for example on a loader without the extension), the previous
+     * default-device behavior is kept: the result is usable when any device can run the encoder.
+     *
+     * @return Selection result.
+     */
+    selected_gpu_t select_capture_gpu() {
+      selected_gpu_t out;
+
+      VkApplicationInfo app = {VK_STRUCTURE_TYPE_APPLICATION_INFO};
+      app.apiVersion = VK_API_VERSION_1_1;
+      VkInstanceCreateInfo ci = {VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
+      ci.pApplicationInfo = &app;
+      static const char *drm_ext = VK_EXT_PHYSICAL_DEVICE_DRM_EXTENSION_NAME;
+      ci.enabledExtensionCount = 1;
+      ci.ppEnabledExtensionNames = &drm_ext;
+
+      VkInstance inst = VK_NULL_HANDLE;
+      if (vkCreateInstance(&ci, nullptr, &inst) != VK_SUCCESS) {
+        // Retry without the extension for loaders that do not support it.
+        ci.enabledExtensionCount = 0;
+        ci.ppEnabledExtensionNames = nullptr;
+        if (vkCreateInstance(&ci, nullptr, &inst) != VK_SUCCESS) {
+          return out;
+        }
+      }
+
+      uint32_t count = 0;
+      vkEnumeratePhysicalDevices(inst, &count, nullptr);
+      std::vector<VkPhysicalDevice> devs(count);
+      vkEnumeratePhysicalDevices(inst, &count, devs.data());
+
+      auto usable = [](VkPhysicalDevice phys) {
+        uint32_t family = 0;
+        return query_device_features(phys).ok() && find_compute_queue_family(phys, family);
+      };
+
+      VkPhysicalDevice matched = VK_NULL_HANDLE;
+      struct stat node_stat;
+      auto render_path = platf::resolve_render_device();
+      if (!render_path.empty() && render_path[0] == '/' && stat(render_path.c_str(), &node_stat) == 0) {
+        auto target_major = major(node_stat.st_rdev);
+        auto target_minor = minor(node_stat.st_rdev);
+        for (auto phys : devs) {
+          VkPhysicalDeviceDrmPropertiesEXT drm = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRM_PROPERTIES_EXT};
+          VkPhysicalDeviceProperties2 props2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+          props2.pNext = &drm;
+          vkGetPhysicalDeviceProperties2(phys, &props2);
+          if (drm.hasRender && drm.renderMajor == (int64_t) target_major && drm.renderMinor == (int64_t) target_minor) {
+            matched = phys;
+            break;
+          }
+        }
+      }
+
+      if (matched) {
+        out.matched = true;
+        out.usable = usable(matched);
+
+        VkPhysicalDeviceProperties props = {};
+        vkGetPhysicalDeviceProperties(matched, &props);
+        out.name = props.deviceName;
+
+        VkPhysicalDeviceIDProperties id = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES};
+        VkPhysicalDeviceProperties2 props2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+        props2.pNext = &id;
+        vkGetPhysicalDeviceProperties2(matched, &props2);
+        std::memcpy(out.uuid.uuid, id.deviceUUID, VK_UUID_SIZE);
+      } else {
+        for (auto phys : devs) {
+          if (usable(phys)) {
+            out.usable = true;
+            break;
+          }
+        }
+      }
+
+      vkDestroyInstance(inst, nullptr);
+      return out;
+    }
+
+    /**
+     * @brief Human-readable name for a Vulkan global queue priority.
+     *
+     * @param priority Priority to name.
+     * @return Static name of the priority level.
+     */
+    const char *queue_priority_name(VkQueueGlobalPriority priority) {
+      switch (priority) {
+        case VK_QUEUE_GLOBAL_PRIORITY_LOW_EXT:
+          return "low";
+        case VK_QUEUE_GLOBAL_PRIORITY_MEDIUM_EXT:
+          return "medium";
+        case VK_QUEUE_GLOBAL_PRIORITY_HIGH_EXT:
+          return "high";
+        case VK_QUEUE_GLOBAL_PRIORITY_REALTIME_EXT:
+          return "realtime";
+        default:
+          return "unknown";
+      }
+    }
+
+  #if !defined(__FreeBSD__)
+    /**
+     * @brief Temporarily owns CAP_SYS_NICE while running a privileged device-creation task.
+     *
+     * The capability is inherited when the worker thread is created and only needs to be raised
+     * into the effective set for the duration of a task; the kernel checks it per calling thread
+     * when the Vulkan driver creates its GPU context.
+     */
+    class cap_sys_nice {
+    public:
+      cap_sys_nice() {
+        caps = cap_get_proc();
+        if (!caps) {
+          BOOST_LOG(warning) << "PyroWave: privileged worker could not read its capabilities"sv;
+          return;
+        }
+
+        cap_value_t sys_nice = CAP_SYS_NICE;
+        if (cap_set_flag(caps, CAP_EFFECTIVE, 1, &sys_nice, CAP_SET) || cap_set_proc(caps)) {
+          // The worker is started before main() drops privileges, so a missing capability means the
+          // binary was not granted one (packages install with cap_sys_admin,cap_sys_nice+p).
+          BOOST_LOG(warning) << "PyroWave: privileged worker lacks CAP_SYS_NICE; the driver will refuse GPU queue priorities above medium"sv;
+          cap_free(caps);
+          caps = nullptr;
+        }
+      }
+
+      ~cap_sys_nice() {
+        if (!caps) {
+          return;
+        }
+
+        cap_value_t sys_nice = CAP_SYS_NICE;
+        if (cap_set_flag(caps, CAP_EFFECTIVE, 1, &sys_nice, CAP_CLEAR) || cap_set_proc(caps)) {
+          BOOST_LOG(warning) << "PyroWave: failed to drop CAP_SYS_NICE on the privileged worker"sv;
+        }
+        cap_free(caps);
+      }
+
+      cap_sys_nice(const cap_sys_nice &) = delete;
+      cap_sys_nice &operator=(const cap_sys_nice &) = delete;
+
+    private:
+      cap_t caps = nullptr;  ///< Worker-thread capabilities, or null when unavailable.
+    };
+  #endif
+
+    /**
+     * @brief Reports that the privileged device worker rejected a task.
+     */
+    class privileged_device_worker_stopped final: public std::runtime_error {
+    public:
+      using std::runtime_error::runtime_error;  ///< Inherit standard runtime error constructors.
+    };
+
+    /**
+     * @brief Worker thread that creates PyroWave devices while holding CAP_SYS_NICE.
+     *
+     * Started during startup, before the rest of the process drops privileges: capabilities are
+     * per-thread, so this thread keeps CAP_SYS_NICE and raises it into its effective set around
+     * each task. Tasks run one at a time, which also serializes PyroWave's global device-creation
+     * state across concurrent sessions.
+     */
+    class privileged_device_worker {
+    public:
+      /**
+       * @brief Start the worker if it is not running yet.
+       */
+      static void ensure_started() {
+        instance();
+      }
+
+      /**
+       * @brief Run a task on the privileged worker thread.
+       *
+       * @tparam F Callable type.
+       * @param f Task to run.
+       * @return Result of the task.
+       * @throws privileged_device_worker_stopped when the worker is shutting down.
+       */
+      template<class F>
+      static auto run(F &&f) -> std::invoke_result_t<F> {
+        return instance().run_impl(std::forward<F>(f));
+      }
+
+    private:
+      static privileged_device_worker &instance() {
+        static privileged_device_worker w;
+        return w;
+      }
+
+      privileged_device_worker():
+          thread_ {[this] {
+            sigset_t all;
+            sigfillset(&all);
+            if (pthread_sigmask(SIG_BLOCK, &all, nullptr) != 0) {
+              BOOST_LOG(error) << "PyroWave: failed to block signals in privileged device worker"sv;
+              queue_.stop();
+              return;
+            }
+
+            platf::set_thread_name("pyrowave_worker");
+            for (;;) {
+              auto task = queue_.pop();
+              if (!task) {
+                break;
+              }
+              (*task)();
+            }
+          }} {
+      }
+
+      ~privileged_device_worker() {
+        queue_.stop();
+      }
+
+      template<class F>
+      auto run_impl(F &&f) -> std::invoke_result_t<F> {
+        using R = std::invoke_result_t<F>;
+        auto task = std::make_shared<std::packaged_task<R()>>(
+          [f = std::forward<F>(f)]() mutable -> R {
+  #if !defined(__FreeBSD__)
+            cap_sys_nice nice;
+  #endif
+            return f();
+          }
+        );
+        auto fut = task->get_future();
+
+        if (!queue_.raise([task]() mutable {
+              (*task)();
+            })) {
+          throw privileged_device_worker_stopped {"privileged_device_worker: task rejected (worker stopping)"};
+        }
+
+        return fut.get();
+      }
+
+      safe::queue_t<std::function<void()>> queue_ {32, safe::queue_t<std::function<void()>>::overflow_policy_e::reject};  ///< Queued privileged tasks.
+      std::jthread thread_;  ///< Worker thread holding CAP_SYS_NICE.
+    };
+
+    /**
+     * @brief Create a PyroWave device with a high queue priority when the OS grants it.
+     *
+     * Requests HIGH on the privileged worker thread, where CAP_SYS_NICE lets the kernel accept
+     * priorities above medium. Granite downgrades internally to whatever the actual driver allows;
+     * the granted priority is read back with pyrowave_device_get_global_priority(). When the worker
+     * cannot run the task the request is retried on the calling thread (medium at best), preserving
+     * the unprivileged behavior.
+     *
+     * @param device_uuid Physical device UUID to create the device on, or nullptr for the default.
+     * @param device Receives the created device.
+     * @return True when a device was created.
+     */
+    bool create_device_elevated(const pyrowave_uuid *device_uuid, pyrowave_device *device) {
+      auto attempt = [device_uuid, device] {
+        return pyrowave_create_device_by_compat2(0, 0, device_uuid, nullptr, nullptr, VK_QUEUE_GLOBAL_PRIORITY_HIGH_EXT, device) == PYROWAVE_SUCCESS;
+      };
+
+      try {
+        return privileged_device_worker::run(attempt);
+      } catch (const privileged_device_worker_stopped &e) {
+        BOOST_LOG(warning) << "PyroWave: privileged device worker unavailable: "sv << e.what();
+        return attempt();
+      }
+    }
+
   }  // namespace
 
   crop_rect_t compute_crop_rect(int src_width, int src_height, int width, int height) {
@@ -226,31 +530,11 @@ namespace platf::pyrowave {
   }
 
   bool validate() {
-    VkApplicationInfo app = {VK_STRUCTURE_TYPE_APPLICATION_INFO};
-    app.apiVersion = VK_API_VERSION_1_3;
-    VkInstanceCreateInfo ci = {VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
-    ci.pApplicationInfo = &app;
+    return select_capture_gpu().usable;
+  }
 
-    VkInstance inst = VK_NULL_HANDLE;
-    if (vkCreateInstance(&ci, nullptr, &inst) != VK_SUCCESS) {
-      return false;
-    }
-
-    uint32_t count = 0;
-    vkEnumeratePhysicalDevices(inst, &count, nullptr);
-    std::vector<VkPhysicalDevice> devs(count);
-    vkEnumeratePhysicalDevices(inst, &count, devs.data());
-
-    bool ok = false;
-    for (auto phys : devs) {
-      uint32_t fam;
-      if (query_device_features(phys).ok() && find_compute_queue_family(phys, fam)) {
-        ok = true;
-        break;
-      }
-    }
-    vkDestroyInstance(inst, nullptr);
-    return ok;
+  void ensure_privileged_device_worker_started() {
+    privileged_device_worker::ensure_started();
   }
 
   struct encoder_t::impl_t {
@@ -268,6 +552,18 @@ namespace platf::pyrowave {
     // Packetization buffers, reused across frames (see the sizing comment in encode()).
     std::vector<uint8_t> scratch;  ///< Bitstream output of pyrowave_encoder_packetize().
     std::vector<pyrowave_packet> packets;  ///< Packet table returned by pyrowave_encoder_packetize().
+
+    /// PyroWave-owned external image (fast path). When null, the manually imported linear image
+    /// below is in use instead.
+    pyrowave_image pimg = nullptr;
+
+    /// True when PyroWave was created for an async-compute encode queue (high-priority request
+    /// accepted). The manual import's same-queue-family assumption does not hold then.
+    bool async_encode = false;
+
+    /// True once the external image import failed: the capture's format is effectively fixed for
+    /// the session, so the import (and its per-frame allocation) is not retried every frame.
+    bool external_import_disabled = false;
 
     // Import synchronization on PyroWave's own VkDevice: a one-shot command buffer and fence
     // used to move the freshly captured DMA-BUF into a layout the GPU encode can sample.
@@ -291,7 +587,7 @@ namespace platf::pyrowave {
       // Destroy our GPU resources before the pyrowave device (they live on its VkDevice).
       if (vk_dev) {
         vkDeviceWaitIdle(vk_dev);
-        destroy_import();
+        release_capture();
         if (vk_fence) {
           vkDestroyFence(vk_dev, vk_fence, nullptr);
         }
@@ -345,6 +641,75 @@ namespace platf::pyrowave {
     }
 
     /**
+     * @brief Import a captured DMA-BUF through PyroWave's external image API.
+     *
+     * This is the fast path. PyroWave creates the image on its own device and acquires queue
+     * ownership at encode time, so no per-frame command submission and CPU fence wait is needed
+     * (unlike the manual import below). Captures that do not report a modifier are imported as
+     * DRM_FORMAT_MOD_LINEAR, the same assumption the manual linear import makes. The image is
+     * always in GENERAL layout, per pyrowave.h. On success PyroWave owns the duplicated file
+     * descriptor; on failure ownership stays with the caller, which closes it.
+     *
+     * @param sd Surface descriptor of the captured buffer.
+     * @return True on success.
+     */
+    bool create_pyrowave_image(const egl::surface_descriptor_t &sd) {
+      int fd = dup(sd.fds[0]);
+      if (fd < 0) {
+        return false;
+      }
+
+      // A capture without an explicit modifier is implicitly laid out; the manual path already
+      // treats it as linear, so import it as such through the external image API.
+      uint64_t modifier = (sd.modifier == DRM_FORMAT_MOD_INVALID) ? DRM_FORMAT_MOD_LINEAR : sd.modifier;
+      VkFormat vk_format = drm_fourcc_to_vk_format(sd.fourcc);
+
+      int dmabuf_planes = 0;
+      for (int i = 0; i < 4 && sd.fds[i] >= 0; ++i) {
+        dmabuf_planes++;
+      }
+      int expected = query_modifier_plane_count(vk_phys, vk_format, modifier);
+      int plane_count = (expected > 0 && expected <= dmabuf_planes) ? expected : dmabuf_planes;
+
+      std::array<VkSubresourceLayout, 4> drm_layouts = {};
+      for (int i = 0; i < plane_count; ++i) {
+        drm_layouts[i].offset = sd.offsets[i];
+        drm_layouts[i].rowPitch = sd.pitches[i];
+      }
+
+      VkImageDrmFormatModifierExplicitCreateInfoEXT drm_ci = {VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT};
+      drm_ci.drmFormatModifier = modifier;
+      drm_ci.drmFormatModifierPlaneCount = plane_count;
+      drm_ci.pPlaneLayouts = drm_layouts.data();
+
+      VkImageCreateInfo img_ci = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+      img_ci.pNext = &drm_ci;
+      img_ci.imageType = VK_IMAGE_TYPE_2D;
+      img_ci.format = vk_format;
+      img_ci.extent = {(uint32_t) sd.width, (uint32_t) sd.height, 1};
+      img_ci.mipLevels = 1;
+      img_ci.arrayLayers = 1;
+      img_ci.samples = VK_SAMPLE_COUNT_1_BIT;
+      img_ci.tiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT;
+      img_ci.usage = VK_IMAGE_USAGE_SAMPLED_BIT;
+      img_ci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
+      pyrowave_image_create_info ci {};
+      ci.device = pdev;
+      ci.external_handle = (pyrowave_os_handle) fd;
+      ci.handle_type = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+      ci.image_create_info = &img_ci;
+
+      if (pyrowave_image_create(&ci, &pimg) != PYROWAVE_SUCCESS) {
+        // A failed import leaves the file descriptor owned by the caller.
+        close(fd);
+        pimg = nullptr;
+        return false;
+      }
+      return true;
+    }
+
+    /**
      * @brief Release the per-frame imported capture image.
      */
     void destroy_import() {
@@ -356,6 +721,43 @@ namespace platf::pyrowave {
         vkFreeMemory(vk_dev, imp_mem, nullptr);
         imp_mem = VK_NULL_HANDLE;
       }
+    }
+
+    /**
+     * @brief Release whichever capture import is currently held.
+     */
+    void release_capture() {
+      if (pimg) {
+        pyrowave_image_destroy(pimg);
+        pimg = nullptr;
+      }
+      destroy_import();
+    }
+
+    /**
+     * @brief Make the captured DMA-BUF sampleable by the GPU encode.
+     *
+     * Captures go through PyroWave's external image path, which lets PyroWave manage the image and
+     * its queue ownership. When that fails, captures fall back to the manual import, but only when
+     * PyroWave encodes on the default (graphics/compute) queue: an async-compute encode family
+     * would not own an image transitioned on the manual import's queue, so the fallback is refused
+     * in that case rather than sampling across queue families.
+     *
+     * @param desc Captured image descriptor.
+     * @return True on success.
+     */
+    bool prepare_capture(const egl::img_descriptor_t &desc) {
+      if (!external_import_disabled) {
+        if (create_pyrowave_image(desc.sd)) {
+          return true;
+        }
+        external_import_disabled = true;
+      }
+      if (async_encode) {
+        BOOST_LOG(debug) << "PyroWave: external image import unavailable on an async-compute encode device";
+        return false;
+      }
+      return prepare_dmabuf(desc);
     }
 
     /**
@@ -437,6 +839,7 @@ namespace platf::pyrowave {
         BOOST_LOG(error) << "PyroWave: dmabuf import vkAllocateMemory failed";
         vkDestroyImage(vk_dev, imp_image, nullptr);
         imp_image = VK_NULL_HANDLE;
+        close(fd);
         return false;
       }
       vkBindImageMemory(vk_dev, imp_image, imp_mem, 0);
@@ -499,20 +902,29 @@ namespace platf::pyrowave {
      * @param crop Receives the center-crop rectangle when one is needed; stays untouched otherwise.
      *             It must outlive the encode call, which keeps a pointer to it.
      * @param info Receives the encode descriptor.
+     * @return True on success.
      */
-    void fill_scaled_info(const egl::img_descriptor_t &desc, VkRect2D &crop, pyrowave_scaled_encode_info &info) {
+    bool fill_scaled_info(const egl::img_descriptor_t &desc, VkRect2D &crop, pyrowave_scaled_encode_info &info) {
       const auto &sd = desc.sd;
       info = {};
-      info.view.image = imp_image;
-      info.view.width = (uint32_t) sd.width;
-      info.view.height = (uint32_t) sd.height;
-      info.view.image_format = drm_fourcc_to_vk_format(sd.fourcc);
-      info.view.view_format = info.view.image_format;
-      info.view.mip_level = 0;
-      info.view.layer = 0;
-      info.view.aspect = VK_IMAGE_ASPECT_COLOR_BIT;
-      info.view.swizzle = VK_COMPONENT_SWIZZLE_IDENTITY;
-      info.view.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+      if (pimg) {
+        // PyroWave's external image: the view (and its GENERAL layout) comes from the image itself.
+        if (pyrowave_image_get_image_view(pimg, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_USAGE_SAMPLED_BIT, &info.view) != PYROWAVE_SUCCESS) {
+          BOOST_LOG(error) << "PyroWave: external image view creation failed";
+          return false;
+        }
+      } else {
+        info.view.image = imp_image;
+        info.view.width = (uint32_t) sd.width;
+        info.view.height = (uint32_t) sd.height;
+        info.view.image_format = drm_fourcc_to_vk_format(sd.fourcc);
+        info.view.view_format = info.view.image_format;
+        info.view.mip_level = 0;
+        info.view.layer = 0;
+        info.view.aspect = VK_IMAGE_ASPECT_COLOR_BIT;
+        info.view.swizzle = VK_COMPONENT_SWIZZLE_IDENTITY;
+        info.view.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+      }
 
       // Linux captures arrive display-referred: sRGB for SDR, PQ/BT.2020 for HDR. The scaler
       // re-emits the same encoding, so the full-range BT.709 (SDR) or BT.2020 NCL (HDR) YCbCr
@@ -533,6 +945,7 @@ namespace platf::pyrowave {
         crop.offset = {(int32_t) crop_rect.x, (int32_t) crop_rect.y};
         info.crop_rect = &crop;
       }
+      return true;
     }
   };
 
@@ -565,12 +978,43 @@ namespace platf::pyrowave {
 
     // Let PyroWave create and own its Vulkan (Granite) device. The encoder does not need to share
     // Sunshine's device, and this avoids the raw-device adoption path, which deadlocked inside
-    // Granite's cross-queue submission sync when handed a single externally-created queue. vid/pid 0
-    // and null UUIDs select the default GPU (the same entry point PyroWave's own tests use).
-    if (pyrowave_create_device_by_compat(0, 0, nullptr, nullptr, nullptr, &impl.pdev) != PYROWAVE_SUCCESS) {
+    // Granite's cross-queue submission sync when handed a single externally-created queue.
+    //
+    // The device is pinned to the capture GPU: when the capture render node can be matched, its
+    // deviceUUID selects that exact physical device, so the captured DMA-BUF is imported on the
+    // GPU that produced it (a mismatched device fails the import or takes a slow path).
+    auto gpu = select_capture_gpu();
+    if (!gpu.usable) {
+      BOOST_LOG(error) << "PyroWave: no PyroWave-capable Vulkan device for the capture GPU";
+      return nullptr;
+    }
+    const pyrowave_uuid *uuid = gpu.matched ? &gpu.uuid : nullptr;
+
+    // Request a high GPU scheduling priority for the PyroWave device, so the encode keeps its
+    // latency budget while a game saturates the GPU. The request runs on the privileged worker
+    // thread: Linux only grants priorities above medium to a caller with CAP_SYS_NICE, and the
+    // capability is per-thread, so the session thread cannot use it after startup. Granite
+    // downgrades the request internally to whatever the driver actually grants (read back with
+    // pyrowave_device_get_global_priority()), and falls back to the default-priority overload
+    // when even the elevated request is refused outright. Requesting above medium makes PyroWave
+    // encode on an async compute queue (regardless of what the OS grants), which the manual import
+    // fallback cannot safely transition against.
+    VkQueueGlobalPriority priority = VK_QUEUE_GLOBAL_PRIORITY_MEDIUM_EXT;
+    if (create_device_elevated(uuid, &impl.pdev)) {
+      impl.async_encode = true;
+      priority = pyrowave_device_get_global_priority(impl.pdev);
+    } else if (pyrowave_create_device_by_compat(0, 0, uuid, nullptr, nullptr, &impl.pdev) != PYROWAVE_SUCCESS) {
       BOOST_LOG(error) << "PyroWave: pyrowave_create_device_by_compat failed";
       return nullptr;
     }
+    if (gpu.matched) {
+      BOOST_LOG(info) << "PyroWave: encoding on " << gpu.name;
+    }
+    // How much of the requested priority the OS actually granted. Below high, the encode competes
+    // with game GPU work at the same priority; the privileged worker logs when CAP_SYS_NICE (which
+    // packaged installs apply to the binary) could not be used, and the driver may also refuse a
+    // priority the queue family does not advertise.
+    BOOST_LOG(info) << "PyroWave: GPU queue priority " << queue_priority_name(priority);
 
     pyrowave_encoder_create_info eci {};
     eci.device = impl.pdev;
@@ -624,20 +1068,36 @@ namespace platf::pyrowave {
       log_capture_failure("PyroWave requires a DMA-BUF capture (use encoder=vulkan)");
       return -1;
     }
-    if (!impl.prepare_dmabuf(*desc)) {
+    if (!impl.prepare_capture(*desc)) {
       log_capture_failure("PyroWave: dmabuf import failed");
       return -1;
     }
 
     VkRect2D crop {};
     pyrowave_scaled_encode_info scaling {};
-    impl.fill_scaled_info(*desc, crop, scaling);
+    if (!impl.fill_scaled_info(*desc, crop, scaling)) {
+      impl.release_capture();
+      return -1;
+    }
+
+    // Captures imported through PyroWave's external image API are acquired by the encode submission
+    // itself, so no explicit import sync is needed. The manual linear import path already waited on
+    // its transition, so it passes no acquire either.
+    pyrowave_gpu_external_reference ext_ref {};
+    pyrowave_gpu_sync_operation acquire {};
+    bool external_image = impl.pimg != nullptr;
+    if (external_image) {
+      ext_ref.image = impl.pimg;
+      ext_ref.queue_family_index = VK_QUEUE_FAMILY_EXTERNAL;
+      acquire.images = &ext_ref;
+      acquire.num_images = 1;
+    }
 
     pyrowave_rate_control rc {};
     rc.maximum_bitstream_size = impl.max_bitstream;
 
-    if (pyrowave_encoder_encode_gpu_scaled_synchronous(impl.enc, nullptr, nullptr, &scaling, &rc) != PYROWAVE_SUCCESS) {
-      impl.destroy_import();
+    if (pyrowave_encoder_encode_gpu_scaled_synchronous(impl.enc, external_image ? &acquire : nullptr, nullptr, &scaling, &rc) != PYROWAVE_SUCCESS) {
+      impl.release_capture();
       BOOST_LOG(error) << "PyroWave: encode_gpu_scaled_synchronous failed";
       return -1;
     }
@@ -650,7 +1110,7 @@ namespace platf::pyrowave {
     if (pyrowave_encoder_compute_num_critical_packets(impl.enc, FEC_PROTECTED_BANDS, PACKET_BOUNDARY, 0, &critical_packets) != PYROWAVE_SUCCESS) {
       critical_packets = 0;
     }
-    impl.destroy_import();
+    impl.release_capture();
 
     size_t num_packets = 0;
     if (pyrowave_encoder_compute_num_packets(impl.enc, PACKET_BOUNDARY, &num_packets) != PYROWAVE_SUCCESS) {
@@ -701,6 +1161,15 @@ namespace platf::pyrowave {
       out.push_back((uint8_t) ((v >> 16) & 0xff));
       out.push_back((uint8_t) ((v >> 24) & 0xff));
     };
+
+    // Reserve the exact framed size before writing. The caller hands in a fresh vector every
+    // frame, so without the reservation the per-packet inserts would grow it geometrically and
+    // copy the whole bitstream several times over in the process.
+    size_t framed_size = 4 + out_packets * 4;  // Packet count field and the packet size fields.
+    for (size_t i = 0; i < out_packets; i++) {
+      framed_size += impl.packets[i].size;
+    }
+    out.reserve(framed_size);
 
     out.clear();
     put_u32((uint32_t) out_packets);
