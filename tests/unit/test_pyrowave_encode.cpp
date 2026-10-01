@@ -14,9 +14,10 @@
  * They need a GPU with the Vulkan features PyroWave requires plus a GBM render node, and are
  * skipped otherwise (as in CI containers), matching how the other hardware-dependent tests behave.
  *
- * The fixtures mint their DMA-BUF on the first usable render node while the encoder picks the
- * default GPU, so on a multi-GPU machine where those differ the imported buffer would not be
- * reachable and these tests would report a false failure.
+ * The fixtures mint their DMA-BUF on the first usable render node, while the encoder pins itself
+ * to the GPU Sunshine resolves for capture (the GPU with a connected display, or the configured
+ * adapter). On a multi-GPU machine where those differ the imported buffer would not be reachable
+ * and these tests would report a failure; that mirrors the real capture path.
  */
 #ifdef SUNSHINE_ENABLE_PYROWAVE
 
@@ -324,9 +325,9 @@ namespace {
    * @param expected_cb Expected decoded Cb.
    * @param expected_cr Expected decoded Cr.
    * @param ten_bit True to encode into 10-bit (R16_UNORM) plane containers.
-   * @param modifier DRM modifier to advertise for the minted buffer; the default takes the import
-   * path used when the kernel reports no modifier, while a real modifier takes that of a capture
-   * that does.
+   * @param modifier DRM modifier to advertise for the minted buffer; the default takes the
+   * modifier-less import path (imported as linear), while a real modifier takes that capture's
+   * external image path.
    */
   void expect_solid_colour_round_trip(uint32_t fourcc, uint32_t pixel, uint8_t expected_y, uint8_t expected_cb, uint8_t expected_cr, bool ten_bit, uint64_t modifier = DRM_FORMAT_MOD_INVALID) {
     if (!platf::pyrowave::validate()) {
@@ -404,9 +405,15 @@ TEST(PyroWaveEncodeDmaBufTest, EncodesSolidRedFrom10BitXbgrDmaBuf) {
 
 TEST(PyroWaveEncodeDmaBufTest, EncodesSolidRedFromModifierDmaBuf) {
   // The buffers above are imported as DRM_FORMAT_MOD_INVALID, which is how GBM reports them. A
-  // capture can instead report the modifier explicitly, which takes the DRM format modifier import
-  // path: querying the plane count and passing explicit plane layouts to Vulkan.
+  // capture can instead report the modifier explicitly, which takes PyroWave's external image
+  // path: the image is created on, and acquired by, PyroWave's own device.
   expect_solid_colour_round_trip(DRM_FORMAT_ARGB8888, 0xffff0000u, 54, 99, 255, false, DRM_FORMAT_MOD_LINEAR);
+}
+
+TEST(PyroWaveEncodeDmaBufTest, EncodesSolidRedFrom10BitModifierDmaBuf) {
+  // The external image path with the 10-bit (R16_UNORM) plane containers, i.e. the HDR profile
+  // over the fast import route.
+  expect_solid_colour_round_trip(DRM_FORMAT_XBGR2101010, 0x000003ffu, 54, 99, 255, true, DRM_FORMAT_MOD_LINEAR);
 }
 
 TEST(PyroWaveEncodeDmaBufTest, CenterCropsSourceToStreamAspect) {
