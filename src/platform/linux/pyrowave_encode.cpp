@@ -7,7 +7,6 @@
   // The include order below is deliberate: pyrowave.h fails to compile unless the Vulkan headers
   // were included first, and clang-format would otherwise sort the quoted includes ahead of them.
   // clang-format off
-  #include <algorithm>
   #include <array>
   #include <vector>
 
@@ -28,12 +27,6 @@ namespace platf::pyrowave {
 
   namespace {
 
-    // RGB->YUV plane conversion (SPIR-V), compiled from
-    // src_assets/linux/assets/shaders/vulkan/pyrowave_rgb2yuv.comp by the pyrowave_vulkan_shaders target.
-    const uint32_t rgb2yuv_spv[] =
-  #include "shaders/pyrowave_rgb2yuv.spv.inc"
-      ;
-
     /// PyroWave packet size in bytes. Each packet is independently decodable, so this is a
     /// loss-resilience knob as much as a network one (Moonlight ships one packet per UDP datagram).
     constexpr size_t PACKET_BOUNDARY = 1024;
@@ -52,42 +45,31 @@ namespace platf::pyrowave {
     constexpr size_t MAX_BLOCK_BYTES = 64 * 1024;
 
     /**
-     * @brief Map a DRM fourcc to a Vulkan format + component swizzle (matches vulkan_encode.cpp).
-     */
-    struct drm_format_info {
-      VkFormat format;  ///< Vulkan format matching the DRM fourcc.
-      VkComponentMapping swizzle;  ///< Component mapping needed to present the format as RGB.
-    };
-
-    /**
-     * @brief Resolve the Vulkan format and swizzle used to sample a captured DRM buffer.
+     * @brief Resolve the Vulkan format used to sample a captured DRM buffer.
+     *
+     * The component mapping stays the identity: Vulkan's format swizzle already presents B8G8R8A8
+     * as (R, G, B, A) to the shader, so PyroWave's scaler samples the expected RGB channels.
      *
      * @param fourcc DRM fourcc of the captured buffer.
-     * @return Matching Vulkan format and component swizzle; BGRA is assumed for unknown formats.
+     * @return Matching Vulkan format; BGRA8 is assumed for unknown formats.
      */
-    drm_format_info drm_fourcc_to_vk_format(uint32_t fourcc) {
-      constexpr VkComponentMapping identity = {
-        VK_COMPONENT_SWIZZLE_IDENTITY,
-        VK_COMPONENT_SWIZZLE_IDENTITY,
-        VK_COMPONENT_SWIZZLE_IDENTITY,
-        VK_COMPONENT_SWIZZLE_IDENTITY
-      };
+    VkFormat drm_fourcc_to_vk_format(uint32_t fourcc) {
       switch (fourcc) {
         case DRM_FORMAT_XRGB8888:
         case DRM_FORMAT_ARGB8888:
-          return {VK_FORMAT_B8G8R8A8_UNORM, identity};
+          return VK_FORMAT_B8G8R8A8_UNORM;
         case DRM_FORMAT_XBGR8888:
         case DRM_FORMAT_ABGR8888:
-          return {VK_FORMAT_R8G8B8A8_UNORM, identity};
+          return VK_FORMAT_R8G8B8A8_UNORM;
         case DRM_FORMAT_XRGB2101010:
         case DRM_FORMAT_ARGB2101010:
-          return {VK_FORMAT_A2R10G10B10_UNORM_PACK32, identity};
+          return VK_FORMAT_A2R10G10B10_UNORM_PACK32;
         case DRM_FORMAT_XBGR2101010:
         case DRM_FORMAT_ABGR2101010:
-          return {VK_FORMAT_A2B10G10R10_UNORM_PACK32, identity};
+          return VK_FORMAT_A2B10G10R10_UNORM_PACK32;
         default:
           BOOST_LOG(warning) << "PyroWave: unknown DRM fourcc 0x" << std::hex << fourcc << std::dec << ", assuming B8G8R8A8";
-          return {VK_FORMAT_B8G8R8A8_UNORM, identity};
+          return VK_FORMAT_B8G8R8A8_UNORM;
       }
     }
 
@@ -211,106 +193,37 @@ namespace platf::pyrowave {
       return UINT32_MAX;
     }
 
-    /**
-     * @brief A single R8/R16_UNORM plane image on PyroWave's device.
-     *
-     * Written by the RGB->YUV compute pass and read by the GPU encode.
-     */
-    struct plane_image_t {
-      VkDevice dev = VK_NULL_HANDLE;  ///< Device owning the image.
-      VkImage image = VK_NULL_HANDLE;  ///< Plane image.
-      VkDeviceMemory mem = VK_NULL_HANDLE;  ///< Backing memory for the image.
-      VkImageView view = VK_NULL_HANDLE;  ///< View used for storage-image writes and sampling.
-      int w = 0;  ///< Plane width in pixels.
-      int h = 0;  ///< Plane height in pixels.
-      VkFormat format = VK_FORMAT_R8_UNORM;  ///< Plane container format.
-
-      /**
-       * @brief Create the image, memory, and view.
-       *
-       * @param device Device to create the resources on.
-       * @param pd Physical device used for memory type selection.
-       * @param width Plane width in pixels.
-       * @param height Plane height in pixels.
-       * @param fmt Plane container format.
-       * @return True on success.
-       */
-      bool init(VkDevice device, VkPhysicalDevice pd, int width, int height, VkFormat fmt) {
-        dev = device;
-        w = width;
-        h = height;
-        format = fmt;
-
-        VkImageCreateInfo ci {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
-        ci.imageType = VK_IMAGE_TYPE_2D;
-        ci.format = format;
-        ci.extent = {(uint32_t) w, (uint32_t) h, 1};
-        ci.mipLevels = 1;
-        ci.arrayLayers = 1;
-        ci.samples = VK_SAMPLE_COUNT_1_BIT;
-        ci.tiling = VK_IMAGE_TILING_OPTIMAL;
-        ci.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT;
-        ci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-        ci.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-        if (vkCreateImage(dev, &ci, nullptr, &image) != VK_SUCCESS) {
-          return false;
-        }
-        VkMemoryRequirements mr;
-        vkGetImageMemoryRequirements(dev, image, &mr);
-        VkMemoryAllocateInfo ai {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
-        ai.allocationSize = mr.size;
-        ai.memoryTypeIndex = find_memory_type(pd, mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-        if (ai.memoryTypeIndex == UINT32_MAX || vkAllocateMemory(dev, &ai, nullptr, &mem) != VK_SUCCESS) {
-          return false;
-        }
-        vkBindImageMemory(dev, image, mem, 0);
-
-        VkImageViewCreateInfo vi {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
-        vi.image = image;
-        vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
-        vi.format = format;
-        vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-        return vkCreateImageView(dev, &vi, nullptr, &view) == VK_SUCCESS;
-      }
-
-      /**
-       * @brief Describe the plane as a PyroWave encode input view.
-       *
-       * @return View descriptor; the plane stays in VK_IMAGE_LAYOUT_GENERAL, which PyroWave
-       *         expects for GPU buffers it does not transition itself.
-       */
-      pyrowave_image_view image_view() const {
-        pyrowave_image_view v {};
-        v.image = image;
-        v.width = (uint32_t) w;
-        v.height = (uint32_t) h;
-        v.image_format = format;
-        v.view_format = format;
-        v.mip_level = 0;
-        v.layer = 0;
-        v.aspect = VK_IMAGE_ASPECT_COLOR_BIT;
-        v.swizzle = VK_COMPONENT_SWIZZLE_IDENTITY;
-        v.layout = VK_IMAGE_LAYOUT_GENERAL;
-        return v;
-      }
-
-      /**
-       * @brief Destroy the plane image, view, and memory.
-       */
-      void destroy() {
-        if (view) {
-          vkDestroyImageView(dev, view, nullptr);
-        }
-        if (image) {
-          vkDestroyImage(dev, image, nullptr);
-        }
-        if (mem) {
-          vkFreeMemory(dev, mem, nullptr);
-        }
-      }
-    };
-
   }  // namespace
+
+  crop_rect_t compute_crop_rect(int src_width, int src_height, int width, int height) {
+    crop_rect_t crop {};
+    if (src_width <= 0 || src_height <= 0 || width <= 0 || height <= 0) {
+      return crop;
+    }
+    if ((int64_t) src_width * height == (int64_t) src_height * width) {
+      return crop;  // Same aspect ratio; scale the whole frame.
+    }
+
+    int crop_w = src_width;
+    int crop_h = src_height;
+    if ((int64_t) src_width * height > (int64_t) src_height * width) {
+      // The source is wider than the stream: keep the full height and trim the sides.
+      crop_w = (int) ((int64_t) src_height * width / height);
+    } else {
+      crop_h = (int) ((int64_t) src_width * height / width);
+    }
+
+    // Even alignment keeps 4:2:0 chroma siting clean.
+    crop.width = crop_w & ~1;
+    crop.height = crop_h & ~1;
+    if (crop.width <= 0 || crop.height <= 0) {
+      return crop;
+    }
+    crop.x = ((src_width - crop.width) / 2) & ~1;
+    crop.y = ((src_height - crop.height) / 2) & ~1;
+    crop.needed = true;
+    return crop;
+  }
 
   bool validate() {
     VkApplicationInfo app = {VK_STRUCTURE_TYPE_APPLICATION_INFO};
@@ -345,7 +258,6 @@ namespace platf::pyrowave {
     pyrowave_encoder enc = nullptr;  ///< PyroWave encoder for this session's resolution.
     int width = 0;  ///< Encoded luma width.
     int height = 0;  ///< Encoded luma height.
-    bool yuv444 = false;  ///< True for full-resolution chroma.
     bool ten_bit = false;  ///< True when planes use R16_UNORM containers.
     bool hdr = false;  ///< True to use the BT.2020 PQ color math.
     size_t max_bitstream = 0;  ///< Per-frame bitstream budget in bytes.
@@ -357,45 +269,20 @@ namespace platf::pyrowave {
     std::vector<uint8_t> scratch;  ///< Bitstream output of pyrowave_encoder_packetize().
     std::vector<pyrowave_packet> packets;  ///< Packet table returned by pyrowave_encoder_packetize().
 
-    // GPU encode resources on PyroWave's own VkDevice.
+    // Import synchronization on PyroWave's own VkDevice: a one-shot command buffer and fence
+    // used to move the freshly captured DMA-BUF into a layout the GPU encode can sample.
     VkDevice vk_dev = VK_NULL_HANDLE;  ///< Device PyroWave created and owns.
     VkPhysicalDevice vk_phys = VK_NULL_HANDLE;  ///< Physical device backing vk_dev.
-    VkQueue vk_queue = VK_NULL_HANDLE;  ///< Queue used for the RGB->YUV conversion.
+    VkQueue vk_queue = VK_NULL_HANDLE;  ///< Queue used for the import barrier.
     uint32_t vk_family = 0;  ///< Queue family of vk_queue.
-    VkCommandPool vk_pool = VK_NULL_HANDLE;  ///< Command pool for the conversion pass.
-    VkCommandBuffer vk_cmd = VK_NULL_HANDLE;  ///< Command buffer recording the conversion pass.
-    VkFence vk_fence = VK_NULL_HANDLE;  ///< Fence waited on after the conversion pass.
-    plane_image_t plane_y;  ///< Luma plane.
-    plane_image_t plane_cb;  ///< Cb plane.
-    plane_image_t plane_cr;  ///< Cr plane.
-
-    // RGB->YUV compute-convert pipeline.
-    VkShaderModule conv_shader = VK_NULL_HANDLE;  ///< Conversion compute shader.
-    VkDescriptorSetLayout conv_dsl = VK_NULL_HANDLE;  ///< Descriptor set layout for the conversion.
-    VkPipelineLayout conv_pl = VK_NULL_HANDLE;  ///< Pipeline layout for the conversion.
-    VkPipeline conv_pipe = VK_NULL_HANDLE;  ///< Conversion compute pipeline.
-    VkSampler conv_sampler = VK_NULL_HANDLE;  ///< Linear sampler used for the captured RGB image.
-    VkDescriptorPool conv_pool = VK_NULL_HANDLE;  ///< Descriptor pool holding conv_set.
-    VkDescriptorSet conv_set = VK_NULL_HANDLE;  ///< Descriptor set bound by the conversion.
+    VkCommandPool vk_pool = VK_NULL_HANDLE;  ///< Command pool for the import barrier.
+    VkCommandBuffer vk_cmd = VK_NULL_HANDLE;  ///< Command buffer recording the import barrier.
+    VkFence vk_fence = VK_NULL_HANDLE;  ///< Fence waited on after the import barrier.
     PFN_vkGetMemoryFdPropertiesKHR getMemoryFdProperties = nullptr;  ///< External-memory entry point.
 
-    // Per-frame imported dmabuf image (RGB), destroyed after each convert.
+    // Per-frame imported dmabuf image (RGB), kept alive until the GPU encode has sampled it.
     VkImage imp_image = VK_NULL_HANDLE;  ///< Imported captured buffer.
     VkDeviceMemory imp_mem = VK_NULL_HANDLE;  ///< Memory exported by the captured buffer.
-    VkImageView imp_view = VK_NULL_HANDLE;  ///< View of the imported capture.
-
-    /**
-     * @brief Push constants matching the layout declared in pyrowave_rgb2yuv.comp.
-     */
-    struct convert_pc_t {
-      int32_t dst[2];  ///< Luma output size.
-      int32_t scaled[2];  ///< Aspect-fit content size inside dst.
-      int32_t offset[2];  ///< Letterbox offset.
-      int32_t flip;  ///< 1 to sample the source bottom-up.
-      int32_t chroma444;  ///< 1 for full-resolution chroma.
-      int32_t hdr;  ///< 1 for BT.2020 PQ full range.
-      int32_t scrgb;  ///< 1 when the source is linear scRGB (always 0 on Linux).
-    };
 
     ~impl_t() {
       if (enc) {
@@ -405,27 +292,6 @@ namespace platf::pyrowave {
       if (vk_dev) {
         vkDeviceWaitIdle(vk_dev);
         destroy_import();
-        plane_y.destroy();
-        plane_cb.destroy();
-        plane_cr.destroy();
-        if (conv_pipe) {
-          vkDestroyPipeline(vk_dev, conv_pipe, nullptr);
-        }
-        if (conv_pl) {
-          vkDestroyPipelineLayout(vk_dev, conv_pl, nullptr);
-        }
-        if (conv_dsl) {
-          vkDestroyDescriptorSetLayout(vk_dev, conv_dsl, nullptr);
-        }
-        if (conv_pool) {
-          vkDestroyDescriptorPool(vk_dev, conv_pool, nullptr);
-        }
-        if (conv_sampler) {
-          vkDestroySampler(vk_dev, conv_sampler, nullptr);
-        }
-        if (conv_shader) {
-          vkDestroyShaderModule(vk_dev, conv_shader, nullptr);
-        }
         if (vk_fence) {
           vkDestroyFence(vk_dev, vk_fence, nullptr);
         }
@@ -439,7 +305,7 @@ namespace platf::pyrowave {
     }
 
     /**
-     * @brief Adopt PyroWave's Vulkan device and create the conversion resources.
+     * @brief Adopt PyroWave's Vulkan device and create the import-sync resources.
      *
      * @return True on success.
      */
@@ -474,108 +340,7 @@ namespace platf::pyrowave {
         return false;
       }
 
-      int chroma_w = yuv444 ? width : width / 2;
-      int chroma_h = yuv444 ? height : height / 2;
-      // PyroWave is depth-agnostic (normalized-float wavelet); the plane container depth just
-      // has to match what the client decodes into.
-      VkFormat plane_fmt = ten_bit ? VK_FORMAT_R16_UNORM : VK_FORMAT_R8_UNORM;
-      if (!plane_y.init(vk_dev, vk_phys, width, height, plane_fmt) || !plane_cb.init(vk_dev, vk_phys, chroma_w, chroma_h, plane_fmt) || !plane_cr.init(vk_dev, vk_phys, chroma_w, chroma_h, plane_fmt)) {
-        return false;
-      }
-
       getMemoryFdProperties = (PFN_vkGetMemoryFdPropertiesKHR) vkGetDeviceProcAddr(vk_dev, "vkGetMemoryFdPropertiesKHR");
-      return init_convert();
-    }
-
-    /**
-     * @brief Build the RGB->YUV compute pipeline and bind the persistent plane storage images.
-     *
-     * @return True on success.
-     */
-    bool init_convert() {
-      VkSamplerCreateInfo sci {VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
-      sci.magFilter = sci.minFilter = VK_FILTER_LINEAR;
-      sci.addressModeU = sci.addressModeV = sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-      if (vkCreateSampler(vk_dev, &sci, nullptr, &conv_sampler) != VK_SUCCESS) {
-        return false;
-      }
-
-      VkDescriptorSetLayoutBinding b[4] = {};
-      b[0] = {0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
-      for (int i = 1; i < 4; i++) {
-        b[i] = {(uint32_t) i, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
-      }
-      VkDescriptorSetLayoutCreateInfo dli {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-      dli.bindingCount = 4;
-      dli.pBindings = b;
-      if (vkCreateDescriptorSetLayout(vk_dev, &dli, nullptr, &conv_dsl) != VK_SUCCESS) {
-        return false;
-      }
-
-      VkPushConstantRange pcr {VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(convert_pc_t)};
-      VkPipelineLayoutCreateInfo pli {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
-      pli.setLayoutCount = 1;
-      pli.pSetLayouts = &conv_dsl;
-      pli.pushConstantRangeCount = 1;
-      pli.pPushConstantRanges = &pcr;
-      if (vkCreatePipelineLayout(vk_dev, &pli, nullptr, &conv_pl) != VK_SUCCESS) {
-        return false;
-      }
-
-      VkShaderModuleCreateInfo smi {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
-      smi.codeSize = sizeof(rgb2yuv_spv);
-      smi.pCode = rgb2yuv_spv;
-      if (vkCreateShaderModule(vk_dev, &smi, nullptr, &conv_shader) != VK_SUCCESS) {
-        return false;
-      }
-
-      VkComputePipelineCreateInfo cpi {VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
-      cpi.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
-      cpi.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-      cpi.stage.module = conv_shader;
-      cpi.stage.pName = "main";
-      cpi.layout = conv_pl;
-      if (vkCreateComputePipelines(vk_dev, VK_NULL_HANDLE, 1, &cpi, nullptr, &conv_pipe) != VK_SUCCESS) {
-        return false;
-      }
-
-      VkDescriptorPoolSize ps[2] = {
-        {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1},
-        {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 3}
-      };
-      VkDescriptorPoolCreateInfo dpi {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-      dpi.maxSets = 1;
-      dpi.poolSizeCount = 2;
-      dpi.pPoolSizes = ps;
-      if (vkCreateDescriptorPool(vk_dev, &dpi, nullptr, &conv_pool) != VK_SUCCESS) {
-        return false;
-      }
-      VkDescriptorSetAllocateInfo dsa {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
-      dsa.descriptorPool = conv_pool;
-      dsa.descriptorSetCount = 1;
-      dsa.pSetLayouts = &conv_dsl;
-      if (vkAllocateDescriptorSets(vk_dev, &dsa, &conv_set) != VK_SUCCESS) {
-        return false;
-      }
-
-      // Bind the persistent plane storage images once (binding 0 / RGB is updated per frame).
-      VkDescriptorImageInfo si1 {VK_NULL_HANDLE, plane_y.view, VK_IMAGE_LAYOUT_GENERAL};
-      VkDescriptorImageInfo si2 {VK_NULL_HANDLE, plane_cb.view, VK_IMAGE_LAYOUT_GENERAL};
-      VkDescriptorImageInfo si3 {VK_NULL_HANDLE, plane_cr.view, VK_IMAGE_LAYOUT_GENERAL};
-      VkWriteDescriptorSet w[3] = {};
-      w[0] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-      w[0].dstSet = conv_set;
-      w[0].dstBinding = 1;
-      w[0].descriptorCount = 1;
-      w[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-      w[0].pImageInfo = &si1;
-      w[1] = w[0];
-      w[1].dstBinding = 2;
-      w[1].pImageInfo = &si2;
-      w[2] = w[0];
-      w[2].dstBinding = 3;
-      w[2].pImageInfo = &si3;
-      vkUpdateDescriptorSets(vk_dev, 3, w, 0, nullptr);
       return true;
     }
 
@@ -583,10 +348,6 @@ namespace platf::pyrowave {
      * @brief Release the per-frame imported capture image.
      */
     void destroy_import() {
-      if (imp_view) {
-        vkDestroyImageView(vk_dev, imp_view, nullptr);
-        imp_view = VK_NULL_HANDLE;
-      }
       if (imp_image) {
         vkDestroyImage(vk_dev, imp_image, nullptr);
         imp_image = VK_NULL_HANDLE;
@@ -623,7 +384,7 @@ namespace platf::pyrowave {
       std::array<VkSubresourceLayout, 4> drm_layouts = {};
       VkImageDrmFormatModifierExplicitCreateInfoEXT drm_ci = {VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT};
       VkImageTiling tiling;
-      auto [vk_format, vk_swizzle] = drm_fourcc_to_vk_format(sd.fourcc);
+      VkFormat vk_format = drm_fourcc_to_vk_format(sd.fourcc);
 
       if (sd.modifier != DRM_FORMAT_MOD_INVALID) {
         int dmabuf_planes = 0;
@@ -679,92 +440,40 @@ namespace platf::pyrowave {
         return false;
       }
       vkBindImageMemory(vk_dev, imp_image, imp_mem, 0);
-
-      VkImageViewCreateInfo vi = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
-      vi.image = imp_image;
-      vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
-      vi.format = vk_format;
-      vi.components = vk_swizzle;
-      vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-      if (vkCreateImageView(vk_dev, &vi, nullptr, &imp_view) != VK_SUCCESS) {
-        destroy_import();
-        return false;
-      }
       return true;
     }
 
     /**
-     * @brief Import the captured DMA-BUF and convert RGB->YUV into the plane images on the GPU.
+     * @brief Import the captured DMA-BUF and make it readable by the GPU encode.
+     *
+     * The buffer is imported as an RGB VkImage on PyroWave's device and transitioned to
+     * VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL (discarding its externally owned contents), then
+     * the transition is waited on. PyroWave samples the image later, when its encode commands run,
+     * so the caller must keep the import alive until the encoder's fence has been waited on and
+     * release it with destroy_import().
      *
      * @param desc Captured image descriptor.
      * @return True on success.
      */
-    bool convert_dmabuf(const egl::img_descriptor_t &desc) {
-      const auto &sd = desc.sd;
-      if (!import_dmabuf(sd)) {
+    bool prepare_dmabuf(const egl::img_descriptor_t &desc) {
+      if (!import_dmabuf(desc.sd)) {
         return false;
       }
-
-      // Update the RGB sampler binding for this frame's imported image.
-      VkDescriptorImageInfo rgb {conv_sampler, imp_view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
-      VkWriteDescriptorSet w {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-      w.dstSet = conv_set;
-      w.dstBinding = 0;
-      w.descriptorCount = 1;
-      w.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-      w.pImageInfo = &rgb;
-      vkUpdateDescriptorSets(vk_dev, 1, &w, 0, nullptr);
-
-      // Aspect-preserving fit + even-aligned letterbox.
-      float scalar = std::min((float) width / sd.width, (float) height / sd.height);
-      int scaled_w = ((int) (sd.width * scalar)) & ~1;
-      int scaled_h = ((int) (sd.height * scalar)) & ~1;
-      convert_pc_t pc {};
-      pc.dst[0] = width;
-      pc.dst[1] = height;
-      pc.scaled[0] = scaled_w > 0 ? scaled_w : 2;
-      pc.scaled[1] = scaled_h > 0 ? scaled_h : 2;
-      pc.offset[0] = ((width - pc.scaled[0]) / 2) & ~1;
-      pc.offset[1] = ((height - pc.scaled[1]) / 2) & ~1;
-      pc.flip = desc.y_invert ? 1 : 0;
-      pc.chroma444 = yuv444 ? 1 : 0;
-      pc.hdr = hdr ? 1 : 0;
-      // Linux captures arrive display-referred (sRGB- or PQ-encoded), never linear scRGB.
-      pc.scrgb = 0;
 
       vkResetCommandBuffer(vk_cmd, 0);
       VkCommandBufferBeginInfo beg {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
       beg.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
       vkBeginCommandBuffer(vk_cmd, &beg);
 
-      auto img_barrier = [&](VkImage im, VkImageLayout o, VkImageLayout n, VkAccessFlags sa, VkAccessFlags da, VkPipelineStageFlags ss, VkPipelineStageFlags ds) {
-        VkImageMemoryBarrier mb {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
-        mb.oldLayout = o;
-        mb.newLayout = n;
-        mb.srcQueueFamilyIndex = mb.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        mb.image = im;
-        mb.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-        mb.srcAccessMask = sa;
-        mb.dstAccessMask = da;
-        vkCmdPipelineBarrier(vk_cmd, ss, ds, 0, 0, nullptr, 0, nullptr, 1, &mb);
-      };
-
-      // The imported dmabuf is externally owned and freshly written by the capture, so its contents
-      // may be discarded (UNDEFINED) and only the layout needs to become readable.
-      img_barrier(imp_image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, 0, VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
-      img_barrier(plane_y.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, 0, VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
-      img_barrier(plane_cb.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, 0, VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
-      img_barrier(plane_cr.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, 0, VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
-
-      vkCmdBindPipeline(vk_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, conv_pipe);
-      vkCmdBindDescriptorSets(vk_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, conv_pl, 0, 1, &conv_set, 0, nullptr);
-      vkCmdPushConstants(vk_cmd, conv_pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
-      vkCmdDispatch(vk_cmd, (width + 7) / 8, (height + 7) / 8, 1);
-
-      // Make the plane writes visible; PyroWave's encode reads them (in GENERAL) after our fence.
-      img_barrier(plane_y.image, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
-      img_barrier(plane_cb.image, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
-      img_barrier(plane_cr.image, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+      VkImageMemoryBarrier mb {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+      mb.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+      mb.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+      mb.srcQueueFamilyIndex = mb.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+      mb.image = imp_image;
+      mb.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+      mb.srcAccessMask = 0;
+      mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+      vkCmdPipelineBarrier(vk_cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1, &mb);
       vkEndCommandBuffer(vk_cmd);
 
       VkSubmitInfo si {VK_STRUCTURE_TYPE_SUBMIT_INFO};
@@ -776,13 +485,59 @@ namespace platf::pyrowave {
         return false;
       }
       vkWaitForFences(vk_dev, 1, &vk_fence, VK_TRUE, UINT64_MAX);
-      destroy_import();
       return true;
+    }
+
+    /**
+     * @brief Fill the PyroWave scaled-encode descriptor for the imported capture.
+     *
+     * PyroWave's scaler owns the RGB->YUV conversion and the scaling into the encoder's resolution,
+     * so the captured image is handed to it directly. The scaler always fills the encoder frame,
+     * which is why a source with a different aspect ratio is center-cropped rather than letterboxed.
+     *
+     * @param desc Captured image descriptor.
+     * @param crop Receives the center-crop rectangle when one is needed; stays untouched otherwise.
+     *             It must outlive the encode call, which keeps a pointer to it.
+     * @param info Receives the encode descriptor.
+     */
+    void fill_scaled_info(const egl::img_descriptor_t &desc, VkRect2D &crop, pyrowave_scaled_encode_info &info) {
+      const auto &sd = desc.sd;
+      info = {};
+      info.view.image = imp_image;
+      info.view.width = (uint32_t) sd.width;
+      info.view.height = (uint32_t) sd.height;
+      info.view.image_format = drm_fourcc_to_vk_format(sd.fourcc);
+      info.view.view_format = info.view.image_format;
+      info.view.mip_level = 0;
+      info.view.layer = 0;
+      info.view.aspect = VK_IMAGE_ASPECT_COLOR_BIT;
+      info.view.swizzle = VK_COMPONENT_SWIZZLE_IDENTITY;
+      info.view.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+
+      // Linux captures arrive display-referred: sRGB for SDR, PQ/BT.2020 for HDR. The scaler
+      // re-emits the same encoding, so the full-range BT.709 (SDR) or BT.2020 NCL (HDR) YCbCr
+      // matches the sequence header PyroWave writes.
+      info.input_color_space = hdr ? VK_COLOR_SPACE_HDR10_ST2084_EXT : VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
+      info.output_color_space = info.input_color_space;
+      // PyroWave is depth-agnostic (normalized-float wavelet); the plane container depth just has
+      // to match what the client decodes into.
+      info.intermediate_plane_format = ten_bit ? VK_FORMAT_R16_UNORM : VK_FORMAT_R8_UNORM;
+      // Neutral chroma code point for the container depth (the codec itself is float).
+      info.ycbcr_chroma_midpoint = ten_bit ? 512.0f / 1023.0f : 128.0f / 255.0f;
+      info.force_linear_filtering = false;
+      info.skip_dither = false;
+
+      auto crop_rect = compute_crop_rect(sd.width, sd.height, width, height);
+      if (crop_rect.needed) {
+        crop.extent = {(uint32_t) crop_rect.width, (uint32_t) crop_rect.height};
+        crop.offset = {(int32_t) crop_rect.x, (int32_t) crop_rect.y};
+        info.crop_rect = &crop;
+      }
     }
   };
 
   std::unique_ptr<encoder_t> encoder_t::create(int width, int height, int bitrate_kbps, int frame_rate, bool yuv444, bool ten_bit, bool hdr) {
-    // 4:2:0 requires even dimensions (harmless for 4:4:4; keeps the letterbox math shared).
+    // 4:2:0 requires even dimensions (harmless for 4:4:4; keeps the scaler/crop math shared).
     width &= ~1;
     height &= ~1;
     if (width <= 0 || height <= 0) {
@@ -795,7 +550,6 @@ namespace platf::pyrowave {
 
     impl.width = width;
     impl.height = height;
-    impl.yuv444 = yuv444;
     impl.ten_bit = ten_bit;
     impl.hdr = hdr && ten_bit;  // HDR color math only makes sense in 10-bit containers
 
@@ -857,9 +611,10 @@ namespace platf::pyrowave {
       }
     };
 
-    // PyroWave requires a GPU DMA-BUF capture (e.g. encoder=vulkan): it imports the dmabuf and does
-    // the RGB->YUV conversion on the GPU (zero-copy). Host-mapped (software-capture) frames, which
-    // carry a non-null img.data, are not supported.
+    // PyroWave requires a GPU DMA-BUF capture (e.g. encoder=vulkan): the captured buffer is
+    // imported straight into PyroWave's Vulkan device and handed to its GPU scaler, which owns the
+    // RGB->YUV conversion and the scaling into the encoder's resolution. Host-mapped
+    // (software-capture) frames, which carry a non-null img.data, are not supported.
     if (img.data != nullptr) {
       log_capture_failure("PyroWave requires a DMA-BUF capture (use encoder=vulkan)");
       return -1;
@@ -869,30 +624,33 @@ namespace platf::pyrowave {
       log_capture_failure("PyroWave requires a DMA-BUF capture (use encoder=vulkan)");
       return -1;
     }
-    if (!impl.convert_dmabuf(*desc)) {
-      log_capture_failure("PyroWave: dmabuf convert failed");
+    if (!impl.prepare_dmabuf(*desc)) {
+      log_capture_failure("PyroWave: dmabuf import failed");
       return -1;
     }
 
-    pyrowave_gpu_buffers gb {};
-    gb.planes[0] = impl.plane_y.image_view();
-    gb.planes[1] = impl.plane_cb.image_view();
-    gb.planes[2] = impl.plane_cr.image_view();
+    VkRect2D crop {};
+    pyrowave_scaled_encode_info scaling {};
+    impl.fill_scaled_info(*desc, crop, scaling);
 
     pyrowave_rate_control rc {};
     rc.maximum_bitstream_size = impl.max_bitstream;
 
-    if (pyrowave_encoder_encode_gpu_synchronous(impl.enc, nullptr, nullptr, &gb, &rc) != PYROWAVE_SUCCESS) {
-      BOOST_LOG(error) << "PyroWave: encode_gpu_synchronous failed";
+    if (pyrowave_encoder_encode_gpu_scaled_synchronous(impl.enc, nullptr, nullptr, &scaling, &rc) != PYROWAVE_SUCCESS) {
+      impl.destroy_import();
+      BOOST_LOG(error) << "PyroWave: encode_gpu_scaled_synchronous failed";
       return -1;
     }
 
     // Number of leading packets that carry the coarsest wavelet bands, for the RTP layer's
     // asymmetric FEC. Computed before packetizing; the packing is deterministic and identical.
+    // This waits for the GPU encode's fence, which also means the captured buffer is no longer in
+    // use once it returns, so the import can be released.
     size_t critical_packets = 0;
     if (pyrowave_encoder_compute_num_critical_packets(impl.enc, FEC_PROTECTED_BANDS, PACKET_BOUNDARY, 0, &critical_packets) != PYROWAVE_SUCCESS) {
       critical_packets = 0;
     }
+    impl.destroy_import();
 
     size_t num_packets = 0;
     if (pyrowave_encoder_compute_num_packets(impl.enc, PACKET_BOUNDARY, &num_packets) != PYROWAVE_SUCCESS) {

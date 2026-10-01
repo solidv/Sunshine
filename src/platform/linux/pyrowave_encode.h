@@ -4,9 +4,9 @@
  *
  * PyroWave does not ride the avcodec/nvenc encoder_t abstraction: it owns its own Vulkan 1.3
  * device and emits an already-packetized byte bitstream that Sunshine ships as packet_raw_generic.
- * Captured DMA-BUF frames are imported into PyroWave's Vulkan device, converted RGB->YUV by a
- * compute shader, and encoded on the GPU, so the codec requires a DMA-BUF capture (the `vulkan`
- * capture/encode backend).
+ * Captured DMA-BUF frames are imported into PyroWave's Vulkan device and fed straight to its GPU
+ * scaler/encoder, which converts RGB->YUV and scales into the stream resolution in a single pass,
+ * so the codec requires a DMA-BUF capture (the `vulkan` capture/encode backend).
  *
  * The whole translation unit is compiled only when SUNSHINE_ENABLE_PYROWAVE is defined.
  */
@@ -23,6 +23,32 @@ namespace platf {
 }
 
 namespace platf::pyrowave {
+
+  /**
+   * @brief Center-crop rectangle used to match a capture to the stream's aspect ratio.
+   */
+  struct crop_rect_t {
+    int x = 0;  ///< Left offset in source pixels (even).
+    int y = 0;  ///< Top offset in source pixels (even).
+    int width = 0;  ///< Cropped width in source pixels (even).
+    int height = 0;  ///< Cropped height in source pixels (even).
+    bool needed = false;  ///< False when the source already matches the stream aspect ratio.
+  };
+
+  /**
+   * @brief Compute the center-crop that matches a capture to the stream's aspect ratio.
+   *
+   * PyroWave's scaler always fills the encoder frame with the (optionally cropped) source, so a
+   * capture whose aspect ratio differs from the negotiated stream would otherwise be stretched.
+   * Crop the source symmetrically to the stream aspect instead, aligned to even pixels for 4:2:0.
+   *
+   * @param src_width Captured frame width in pixels.
+   * @param src_height Captured frame height in pixels.
+   * @param width Stream (encoder) width in pixels.
+   * @param height Stream (encoder) height in pixels.
+   * @return Crop rectangle; `needed` is false when the whole frame can be scaled as-is.
+   */
+  crop_rect_t compute_crop_rect(int src_width, int src_height, int width, int height);
 
   /**
    * @brief Probe for a PyroWave-capable Vulkan device.
@@ -56,7 +82,7 @@ namespace platf::pyrowave {
      * @param ten_bit True when a 10-bit profile was negotiated: planes use R16_UNORM containers
      *                (PyroWave is depth-agnostic; the container just must match the client's).
      * @param hdr True to encode HDR content: BT.2020 NCL full-range on PQ-encoded RGB
-     *            (requires ten_bit and an HDR display; else SDR BT.601 math is used).
+     *            (requires ten_bit and an HDR display; else SDR full-range BT.709 is used).
      * @return Session on success, nullptr on failure.
      */
     static std::unique_ptr<encoder_t> create(int width, int height, int bitrate_kbps, int frame_rate, bool yuv444, bool ten_bit, bool hdr);
@@ -64,10 +90,12 @@ namespace platf::pyrowave {
     /**
      * @brief Encode one captured frame into a PyroWave bitstream.
      *
-     * Requires a DMA-BUF captured image. Imports the buffer into PyroWave's Vulkan device,
-     * converts it to YUV on the GPU, runs the synchronous GPU encode, and packetizes the result
-     * into a single contiguous byte buffer (packet boundaries are internal to PyroWave and carried
-     * in the stream). Every frame is intra (IDR).
+     * Requires a DMA-BUF captured image. Imports the buffer into PyroWave's Vulkan device and runs
+     * the synchronous GPU encode directly on it: PyroWave's scaler converts RGB->YUV and scales the
+     * (center-cropped) frame into the stream resolution, full-range BT.709 for SDR or BT.2020 NCL
+     * on PQ for HDR, with the chroma midpoint at the container depth's conventional code point.
+     * The result is packetized into a single contiguous byte buffer (packet boundaries are internal
+     * to PyroWave and carried in the stream). Every frame is intra (IDR).
      *
      * @param img Captured image from the display backend.
      * @param out Receives the encoded, packetized bitstream bytes.
