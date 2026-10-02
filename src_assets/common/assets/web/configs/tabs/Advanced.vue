@@ -20,6 +20,13 @@ const config = ref(props.config)
       <div class="form-text">{{ $t('config.fec_percentage_desc') }}</div>
     </div>
 
+    <!-- Pacing Percentage -->
+    <div class="mb-3">
+      <label for="pacing_percent" class="form-label">{{ $t('config.pacing_percent') }}</label>
+      <input type="text" class="form-control" id="pacing_percent" placeholder="80" v-model="config.pacing_percent" />
+      <div class="form-text">{{ $t('config.pacing_percent_desc') }}</div>
+    </div>
+
     <!-- Quantization Parameter -->
     <div class="mb-3">
       <label for="qp" class="form-label">{{ $t('config.qp') }}</label>

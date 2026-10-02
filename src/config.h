@@ -257,6 +257,8 @@ namespace config {
 
     int fec_percentage;  ///< Percentage of forward-error-correction packets to add to the stream.
 
+    int pacing_percent;  ///< Intra-frame send pacing as a percentage of 1 Gbps; 0 disables pacing.
+
     // Video encryption settings for LAN and WAN streams
     int lan_encryption_mode;  ///< Video encryption policy for LAN clients.
     int wan_encryption_mode;  ///< Video encryption policy for WAN clients.

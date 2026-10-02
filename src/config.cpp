@@ -819,6 +819,7 @@ namespace config {
     APPS_JSON_PATH,
 
     20,  // fecPercentage
+    80,  // pacing_percent
 
     ENCRYPTION_MODE_NEVER,  // lan_encryption_mode
     ENCRYPTION_MODE_OPPORTUNISTIC,  // wan_encryption_mode
@@ -1805,6 +1806,8 @@ namespace config {
 #endif
 
     int_between_f(vars, "fec_percentage", stream.fec_percentage, {1, 255});
+
+    int_between_f(vars, "pacing_percent", stream.pacing_percent, {0, 100});
 
     map_int_int_f(vars, "keybindings"s, input.keybindings);
 
