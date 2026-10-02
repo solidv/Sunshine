@@ -45,9 +45,18 @@ namespace platf::pyrowave {
 
   namespace {
 
-    /// PyroWave packet size in bytes. Each packet is independently decodable, so this is a
-    /// loss-resilience knob as much as a network one (Moonlight ships one packet per UDP datagram).
-    constexpr size_t PACKET_BOUNDARY = 1024;
+    /// PyroWave packet size in bytes used when no negotiated packet size is available. Each packet
+    /// is independently decodable, so this is a loss-resilience knob as much as a network one.
+    constexpr size_t DEFAULT_PACKET_BOUNDARY = 1024;
+
+    /// Bytes the transport framing adds in front of every chunk (`[u32 size]`).
+    constexpr size_t TRANSPORT_CHUNK_PREFIX_BYTES = sizeof(uint32_t);
+
+    /// Bytes the RTP layer adds to a negotiated packet size (matches `MAX_RTP_HEADER_SIZE`).
+    constexpr int RTP_HEADER_ALLOWANCE = 16;
+
+    /// On-wire bytes of the RTP and GameStream video headers (`video_packet_raw_t`).
+    constexpr int VIDEO_PACKET_HEADER_BYTES = 32;
 
     /**
      * @brief Wavelet bands (counted from the coarsest level) covered by the FEC-protected head.
@@ -499,6 +508,19 @@ namespace platf::pyrowave {
 
   }  // namespace
 
+  size_t packet_boundary_for_packet_size(int packet_size) {
+    // One datagram carries packet_size + RTP_HEADER_ALLOWANCE - VIDEO_PACKET_HEADER_BYTES bytes of
+    // video payload (see videoBroadcastThread's payload_blocksize), and the transport framing adds
+    // TRANSPORT_CHUNK_PREFIX_BYTES in front of every chunk. A chunk of packet_size - 20 bytes
+    // therefore never needs more than one datagram. stream.cpp static_asserts the header sizes
+    // this relies on.
+    constexpr int min_packet_size = RTP_HEADER_ALLOWANCE + VIDEO_PACKET_HEADER_BYTES + (int) TRANSPORT_CHUNK_PREFIX_BYTES;
+    if (packet_size < min_packet_size) {
+      return DEFAULT_PACKET_BOUNDARY;
+    }
+    return (size_t) (packet_size + RTP_HEADER_ALLOWANCE - VIDEO_PACKET_HEADER_BYTES - (int) TRANSPORT_CHUNK_PREFIX_BYTES);
+  }
+
   crop_rect_t compute_crop_rect(int src_width, int src_height, int width, int height) {
     crop_rect_t crop {};
     if (src_width <= 0 || src_height <= 0 || width <= 0 || height <= 0) {
@@ -552,6 +574,9 @@ namespace platf::pyrowave {
     // Packetization buffers, reused across frames (see the sizing comment in encode()).
     std::vector<uint8_t> scratch;  ///< Bitstream output of pyrowave_encoder_packetize().
     std::vector<pyrowave_packet> packets;  ///< Packet table returned by pyrowave_encoder_packetize().
+
+    /// Transport chunk boundary in bytes, derived from the client's negotiated packet size.
+    size_t packet_boundary = DEFAULT_PACKET_BOUNDARY;
 
     /// True when the client negotiated the active-block sideband (see encoder_t::create()).
     bool active_block_sideband = false;
@@ -958,7 +983,7 @@ namespace platf::pyrowave {
     }
   };
 
-  std::unique_ptr<encoder_t> encoder_t::create(int width, int height, int bitrate_kbps, int frame_rate, bool yuv444, bool ten_bit, bool hdr, bool active_block_sideband) {
+  std::unique_ptr<encoder_t> encoder_t::create(int width, int height, int bitrate_kbps, int frame_rate, bool yuv444, bool ten_bit, bool hdr, bool active_block_sideband, int packet_size) {
     // 4:2:0 requires even dimensions (harmless for 4:4:4; keeps the scaler/crop math shared).
     width &= ~1;
     height &= ~1;
@@ -975,6 +1000,7 @@ namespace platf::pyrowave {
     impl.ten_bit = ten_bit;
     impl.hdr = hdr && ten_bit;  // HDR color math only makes sense in 10-bit containers
     impl.active_block_sideband = active_block_sideband;
+    impl.packet_boundary = packet_boundary_for_packet_size(packet_size);
 
     // Per-frame byte budget from bitrate. Intra-only: bitrate / fps bytes per frame.
     if (frame_rate <= 0) {
@@ -1118,7 +1144,7 @@ namespace platf::pyrowave {
     // This waits for the GPU encode's fence, which also means the captured buffer is no longer in
     // use once it returns, so the import can be released.
     size_t critical_packets = 0;
-    if (pyrowave_encoder_compute_num_critical_packets(impl.enc, FEC_PROTECTED_BANDS, PACKET_BOUNDARY, 0, &critical_packets) != PYROWAVE_SUCCESS) {
+    if (pyrowave_encoder_compute_num_critical_packets(impl.enc, FEC_PROTECTED_BANDS, impl.packet_boundary, 0, &critical_packets) != PYROWAVE_SUCCESS) {
       critical_packets = 0;
     }
 
@@ -1146,18 +1172,18 @@ namespace platf::pyrowave {
     impl.release_capture();
 
     size_t num_packets = 0;
-    if (pyrowave_encoder_compute_num_packets(impl.enc, PACKET_BOUNDARY, &num_packets) != PYROWAVE_SUCCESS) {
+    if (pyrowave_encoder_compute_num_packets(impl.enc, impl.packet_boundary, &num_packets) != PYROWAVE_SUCCESS) {
       BOOST_LOG(error) << "PyroWave: compute_num_packets failed";
       return -1;
     }
 
-    // Size the bitstream buffer for the worst case, NOT num_packets * PACKET_BOUNDARY:
+    // Size the bitstream buffer for the worst case, NOT num_packets * packet_boundary:
     // pyrowave's packetize() only closes a packet after the block that overflows it, so a packet
-    // can exceed PACKET_BOUNDARY by one block (up to 4097 words; payload_words is a 12-bit field),
+    // can exceed packet_boundary by one block (up to 4097 words; payload_words is a 12-bit field),
     // and packetize() does not bounds-check the output buffer in release builds. High-entropy
     // frames (e.g. full-range 10-bit HDR) actually hit this. Buffers are reused across frames
     // (grow-only).
-    size_t scratch_bound = 4096 + num_packets * (PACKET_BOUNDARY + MAX_BLOCK_BYTES);
+    size_t scratch_bound = 4096 + num_packets * (impl.packet_boundary + MAX_BLOCK_BYTES);
     if (impl.scratch.size() < scratch_bound) {
       impl.scratch.resize(scratch_bound);
     }
@@ -1165,7 +1191,7 @@ namespace platf::pyrowave {
       impl.packets.resize(num_packets);
     }
     size_t out_packets = 0;
-    if (pyrowave_encoder_packetize(impl.enc, impl.packets.data(), PACKET_BOUNDARY, &out_packets, impl.scratch.data(), impl.scratch.size()) != PYROWAVE_SUCCESS) {
+    if (pyrowave_encoder_packetize(impl.enc, impl.packets.data(), impl.packet_boundary, &out_packets, impl.scratch.data(), impl.scratch.size()) != PYROWAVE_SUCCESS) {
       BOOST_LOG(error) << "PyroWave: packetize failed";
       return -1;
     }

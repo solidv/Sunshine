@@ -152,6 +152,11 @@ namespace stream {
     NV_VIDEO_PACKET packet;  ///< GameStream video packet header.
   };
 
+  // PyroWave's transport chunk sizing (packet_boundary_for_packet_size) derives the per-datagram
+  // video payload from these two header sizes; keep them in sync.
+  static_assert(sizeof(video_packet_raw_t) == 32, "PyroWave chunk sizing assumes 32 bytes of video packet headers");
+  static_assert(MAX_RTP_HEADER_SIZE == 16, "PyroWave chunk sizing assumes a 16-byte RTP header allowance");
+
   /**
    * @brief AES-GCM prefix written before encrypted video packet payloads.
    */

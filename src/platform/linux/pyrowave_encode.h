@@ -81,6 +81,19 @@ namespace platf::pyrowave {
   bool validate();
 
   /**
+   * @brief Compute PyroWave's transport chunk boundary for a negotiated packet size.
+   *
+   * A PyroWave frame is framed into `[u32 size][packet]` chunks so the decoder can push each packet
+   * separately. Sizing the chunk to the negotiated RTP payload keeps one chunk within one datagram,
+   * which cuts the per-chunk framing overhead and decoder pushes compared with the fixed 1024-byte
+   * default. Falls back to 1024 for unknown or degenerate packet sizes.
+   *
+   * @param packet_size Negotiated maximum packet payload (`x-nv-video[0].packetSize`), or 0.
+   * @return Chunk boundary in bytes.
+   */
+  size_t packet_boundary_for_packet_size(int packet_size);
+
+  /**
    * @brief One PyroWave encode session bound to a stream's width/height.
    *
    * Owns a dedicated Vulkan device plus a pyrowave_encoder. The device is pinned to the capture
@@ -110,9 +123,11 @@ namespace platf::pyrowave {
      *                              the FEC-protected bands, so the client can tell a coarse block
      *                              that was never transmitted (empty) from a lost one when
      *                              validating a partial frame.
+     * @param packet_size Negotiated maximum packet payload (`x-nv-video[0].packetSize`), used to
+     *                    size the transport chunk boundary; 0 keeps the default.
      * @return Session on success, nullptr on failure.
      */
-    static std::unique_ptr<encoder_t> create(int width, int height, int bitrate_kbps, int frame_rate, bool yuv444, bool ten_bit, bool hdr, bool active_block_sideband);
+    static std::unique_ptr<encoder_t> create(int width, int height, int bitrate_kbps, int frame_rate, bool yuv444, bool ten_bit, bool hdr, bool active_block_sideband, int packet_size);
 
     /**
      * @brief Encode one captured frame into a PyroWave bitstream.

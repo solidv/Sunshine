@@ -370,7 +370,7 @@ namespace {
     img.sd.modifier = modifier;
     ASSERT_GE(img.sd.fds[0], 0);
 
-    auto encoder = platf::pyrowave::encoder_t::create(image_width, image_height, encode_bitrate_kbps, encode_frame_rate, false, ten_bit, false, active_block_sideband);
+    auto encoder = platf::pyrowave::encoder_t::create(image_width, image_height, encode_bitrate_kbps, encode_frame_rate, false, ten_bit, false, active_block_sideband, 1392);
     ASSERT_NE(encoder, nullptr) << "PyroWave encoder creation failed";
 
     std::vector<uint8_t> bitstream;
@@ -486,7 +486,7 @@ TEST(PyroWaveEncodeDmaBufTest, CenterCropsSourceToStreamAspect) {
 
   constexpr int stream_width = image_width;
   constexpr int stream_height = image_height / 2;
-  auto encoder = platf::pyrowave::encoder_t::create(stream_width, stream_height, encode_bitrate_kbps, encode_frame_rate, false, false, false, false);
+  auto encoder = platf::pyrowave::encoder_t::create(stream_width, stream_height, encode_bitrate_kbps, encode_frame_rate, false, false, false, false, 1392);
   ASSERT_NE(encoder, nullptr) << "PyroWave encoder creation failed";
 
   std::vector<uint8_t> bitstream;
@@ -560,8 +560,24 @@ TEST(PyroWavePrivilegedWorkerTest, StartsIdempotentlyAndCreatesEncoder) {
 
   // Device creation runs through the privileged worker; without the capability (as in tests and
   // unprivileged builds) Granite's internal fallback still grants medium priority.
-  auto encoder = platf::pyrowave::encoder_t::create(image_width, image_height, encode_bitrate_kbps, encode_frame_rate, false, false, false);
+  auto encoder = platf::pyrowave::encoder_t::create(image_width, image_height, encode_bitrate_kbps, encode_frame_rate, false, false, false, false, 1392);
   ASSERT_NE(encoder, nullptr) << "PyroWave encoder creation failed";
+}
+
+TEST(PyroWavePacketBoundaryTest, DerivesBoundaryFromNegotiatedPacketSize) {
+  // One datagram carries packet_size + 16 - 32 video payload bytes, and the framing prefixes each
+  // chunk with a u32, so a chunk of packet_size - 20 bytes fits one datagram.
+  EXPECT_EQ(platf::pyrowave::packet_boundary_for_packet_size(1392), 1372u);
+  EXPECT_EQ(platf::pyrowave::packet_boundary_for_packet_size(1024), 1004u);
+  EXPECT_EQ(platf::pyrowave::packet_boundary_for_packet_size(1456), 1436u);
+}
+
+TEST(PyroWavePacketBoundaryTest, FallsBackForUnknownOrDegeneratePacketSizes) {
+  // 0 means the client did not negotiate a size; sizes that cannot hold a single chunk keep the
+  // historical 1024-byte boundary instead of underflowing.
+  EXPECT_EQ(platf::pyrowave::packet_boundary_for_packet_size(0), 1024u);
+  EXPECT_EQ(platf::pyrowave::packet_boundary_for_packet_size(-1), 1024u);
+  EXPECT_EQ(platf::pyrowave::packet_boundary_for_packet_size(51), 1024u);
 }
 
 #endif  // SUNSHINE_ENABLE_PYROWAVE

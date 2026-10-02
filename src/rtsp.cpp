@@ -1213,6 +1213,9 @@ namespace rtsp_stream {
       // The client only requests the PyroWave active-block sideband after seeing the host capability
       // in x-ss-general.featureFlags, so honoring the request keeps older hosts/clients unambiguous.
       config.monitor.pyrowaveActiveBlockSideband = (config.mlFeatureFlags & ML_FF_PYROWAVE_ACTIVE_BLOCK_MASK) != 0;
+      // The encoder sizes its transport chunks to the negotiated packet size so one chunk fits one
+      // datagram (PyroWave only).
+      config.monitor.packetSize = config.packetsize;
 
       configuredBitrateKbps = util::from_view(args.at("x-ml-video.configuredBitrateKbps"sv));
     } catch (std::out_of_range &) {

@@ -75,6 +75,7 @@ namespace video {
     int chromaSamplingType;  ///< Chroma sampling type: 0 = 4:2:0, 1 = 4:4:4.
     int enableIntraRefresh;  ///< Intra refresh setting: 0 = disabled, 1 = enabled.
     bool pyrowaveActiveBlockSideband;  ///< True when the client negotiated the PyroWave active-block sideband.
+    int packetSize;  ///< Negotiated maximum packet payload in bytes (`x-nv-video[0].packetSize`); 0 when unknown.
   };
 
   /**
