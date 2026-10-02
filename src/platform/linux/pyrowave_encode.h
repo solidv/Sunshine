@@ -105,9 +105,14 @@ namespace platf::pyrowave {
      *                (PyroWave is depth-agnostic; the container just must match the client's).
      * @param hdr True to encode HDR content: BT.2020 NCL full-range on PQ-encoded RGB
      *            (requires ten_bit and an HDR display; else SDR full-range BT.709 is used).
+     * @param active_block_sideband True when the client negotiated the active-block sideband: each
+     *                              frame then carries the mask of blocks the encoder transmitted in
+     *                              the FEC-protected bands, so the client can tell a coarse block
+     *                              that was never transmitted (empty) from a lost one when
+     *                              validating a partial frame.
      * @return Session on success, nullptr on failure.
      */
-    static std::unique_ptr<encoder_t> create(int width, int height, int bitrate_kbps, int frame_rate, bool yuv444, bool ten_bit, bool hdr);
+    static std::unique_ptr<encoder_t> create(int width, int height, int bitrate_kbps, int frame_rate, bool yuv444, bool ten_bit, bool hdr, bool active_block_sideband);
 
     /**
      * @brief Encode one captured frame into a PyroWave bitstream.
@@ -117,15 +122,23 @@ namespace platf::pyrowave {
      * (center-cropped) frame into the stream resolution, full-range BT.709 for SDR or BT.2020 NCL
      * on PQ for HDR, with the chroma midpoint at the container depth's conventional code point.
      * The result is packetized into a single contiguous byte buffer (packet boundaries are internal
-     * to PyroWave and carried in the stream). Every frame is intra (IDR).
+     * to PyroWave and carried in the stream). Every frame is intra (IDR). The transport framing is
+     *
+     *   [u32 packet count] { [u32 size] [size bytes] } * packet count
+     *
+     * and, when the active-block sideband was negotiated, a mask header follows the packet count:
+     *
+     *   [u32 packet count] [u32 mask words] [words * u32] { [u32 size] [size bytes] } * packet count
+     *
+     * where bit b of word b / 32 is set when block b of the FEC-protected bands was transmitted.
      *
      * @param img Captured image from the display backend.
      * @param out Receives the encoded, packetized bitstream bytes.
      * @param head_bytes Receives the byte offset into @p out where the loss-critical head ends
-     *                   (the sequence header plus wavelet levels 4 and 3 — PyroWave emits coarse
-     *                   levels first). The RTP layer protects `[0, head_bytes)` with Reed-Solomon
-     *                   and leaves the tail bare. 0 when the frame is too small to split (and on
-     *                   failure), meaning "use the normal even FEC split".
+     *                   (the sequence header, any mask header, and the coarsest wavelet levels —
+     *                   PyroWave emits coarse levels first). The RTP layer protects `[0, head_bytes)`
+     *                   with Reed-Solomon and leaves the tail bare. 0 when the frame is too small to
+     *                   split (and on failure), meaning "use the normal even FEC split".
      * @return 0 on success, negative on failure.
      */
     int encode(const platf::img_t &img, std::vector<uint8_t> &out, size_t &head_bytes);

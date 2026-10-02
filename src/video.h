@@ -41,6 +41,21 @@ struct AVPacket;
   #define SCM_PYROWAVE10_444 0x04000000  ///< PyroWave 4:4:4 10-bit.
 #endif
 
+/**
+ * @brief `x-ml-general.featureFlags` bit a client sets to receive the PyroWave active-block sideband.
+ *
+ * The client sets it only after the host advertised the matching capability in
+ * `x-ss-general.featureFlags` (`platform_caps::pyrowave_active_block_mask`). When set, each
+ * PyroWave frame carries the mask of blocks the encoder transmitted in the FEC-protected bands,
+ * which lets the client tell a coarse block that was never transmitted (empty) from a lost one
+ * when validating a partial frame. Defined here, like the SCM_PYROWAVE bits, so it stays harmless
+ * once moonlight-common-c provides the definition. The wire format keeps host and client
+ * little-endian.
+ */
+#ifndef ML_FF_PYROWAVE_ACTIVE_BLOCK_MASK
+  #define ML_FF_PYROWAVE_ACTIVE_BLOCK_MASK 0x04  ///< Client parses the PyroWave active-block sideband.
+#endif
+
 namespace video {
 
   /**
@@ -59,6 +74,7 @@ namespace video {
     int dynamicRange;  ///< Encoding color depth: 0 = 8-bit, 1 = 10-bit.
     int chromaSamplingType;  ///< Chroma sampling type: 0 = 4:2:0, 1 = 4:4:4.
     int enableIntraRefresh;  ///< Intra refresh setting: 0 = disabled, 1 = enabled.
+    bool pyrowaveActiveBlockSideband;  ///< True when the client negotiated the PyroWave active-block sideband.
   };
 
   /**

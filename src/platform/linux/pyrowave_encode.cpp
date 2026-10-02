@@ -553,6 +553,15 @@ namespace platf::pyrowave {
     std::vector<uint8_t> scratch;  ///< Bitstream output of pyrowave_encoder_packetize().
     std::vector<pyrowave_packet> packets;  ///< Packet table returned by pyrowave_encoder_packetize().
 
+    /// True when the client negotiated the active-block sideband (see encoder_t::create()).
+    bool active_block_sideband = false;
+
+    /// Active-block mask for the FEC-protected bands, reused across frames (grow-only).
+    std::vector<uint32_t> active_mask;
+
+    /// Whether the active-block mask diagnostic was already logged for this session.
+    bool logged_mask_failure = false;
+
     /// PyroWave-owned external image (fast path). When null, the manually imported linear image
     /// below is in use instead.
     pyrowave_image pimg = nullptr;
@@ -949,7 +958,7 @@ namespace platf::pyrowave {
     }
   };
 
-  std::unique_ptr<encoder_t> encoder_t::create(int width, int height, int bitrate_kbps, int frame_rate, bool yuv444, bool ten_bit, bool hdr) {
+  std::unique_ptr<encoder_t> encoder_t::create(int width, int height, int bitrate_kbps, int frame_rate, bool yuv444, bool ten_bit, bool hdr, bool active_block_sideband) {
     // 4:2:0 requires even dimensions (harmless for 4:4:4; keeps the scaler/crop math shared).
     width &= ~1;
     height &= ~1;
@@ -965,6 +974,7 @@ namespace platf::pyrowave {
     impl.height = height;
     impl.ten_bit = ten_bit;
     impl.hdr = hdr && ten_bit;  // HDR color math only makes sense in 10-bit containers
+    impl.active_block_sideband = active_block_sideband;
 
     // Per-frame byte budget from bitrate. Intra-only: bitrate / fps bytes per frame.
     if (frame_rate <= 0) {
@@ -1034,7 +1044,8 @@ namespace platf::pyrowave {
     BOOST_LOG(info) << "PyroWave encoder ready (GPU): " << width << "x" << height
                     << (yuv444 ? " 4:4:4" : " 4:2:0")
                     << (ten_bit ? (impl.hdr ? " 10-bit HDR" : " 10-bit SDR") : " 8-bit")
-                    << " budget " << impl.max_bitstream << " bytes/frame";
+                    << " budget " << impl.max_bitstream << " bytes/frame"
+                    << (active_block_sideband ? ", active-block sideband" : "");
     return self;
   }
 
@@ -1110,6 +1121,28 @@ namespace platf::pyrowave {
     if (pyrowave_encoder_compute_num_critical_packets(impl.enc, FEC_PROTECTED_BANDS, PACKET_BOUNDARY, 0, &critical_packets) != PYROWAVE_SUCCESS) {
       critical_packets = 0;
     }
+
+    // Compute the active-block sideband while this frame's metadata is still the queued one. The
+    // mask covers the same coarse bands the client validates a partial frame against (its
+    // pristine-band check uses the same 3-band boundary), so it can tell a block the encoder never
+    // transmitted from one that was lost. A failure drops the mask for this frame (word count 0),
+    // which leaves the client on its conservative path.
+    impl.active_mask.clear();
+    if (impl.active_block_sideband) {
+      size_t num_active_blocks = 0;
+      bool mask_ok = pyrowave_encoder_get_num_active_blocks(impl.enc, FEC_PROTECTED_BANDS, &num_active_blocks) == PYROWAVE_SUCCESS;
+      if (mask_ok && num_active_blocks > 0) {
+        impl.active_mask.resize((num_active_blocks + 31) / 32);
+        mask_ok = pyrowave_encoder_compute_block_active_words(impl.enc, FEC_PROTECTED_BANDS, impl.active_mask.data(), impl.active_mask.size()) == PYROWAVE_SUCCESS;
+      }
+      if (!mask_ok) {
+        impl.active_mask.clear();
+        if (!impl.logged_mask_failure) {
+          impl.logged_mask_failure = true;
+          BOOST_LOG(warning) << "PyroWave: active-block mask computation failed; frames will not carry it";
+        }
+      }
+    }
     impl.release_capture();
 
     size_t num_packets = 0;
@@ -1143,13 +1176,21 @@ namespace platf::pyrowave {
     //
     //   [u32 packet_count] { [u32 size] [size bytes] } * packet_count
     //
-    // The Moonlight PyroWave decoder parses this framing and re-pushes each PyroWave packet.
+    // When the client negotiated the active-block sideband, the mask of transmitted blocks in the
+    // FEC-protected bands follows the packet count (bit b of word b / 32 = block b was sent):
     //
-    // The loss-critical head ends where the coarsest bands end. A frame that is entirely critical
-    // (or too small to split) has no tail to leave bare, so it keeps the even split (head_bytes 0).
+    //   [u32 packet_count] [u32 mask_words] [mask_words * u32] { [u32 size] [size bytes] } * count
+    //
+    // The Moonlight PyroWave decoder parses this framing and re-pushes each PyroWave packet; the
+    // mask is protected as part of the head so a truncated frame still carries it.
+    const size_t mask_bytes = impl.active_block_sideband ? 4 + impl.active_mask.size() * 4 : 0;
+
+    // The loss-critical head ends where the coarsest bands end, plus any mask header. A frame that
+    // is entirely critical (or too small to split) has no tail to leave bare, so it keeps the even
+    // split (head_bytes 0).
     head_bytes = 0;
     if (critical_packets > 0 && critical_packets < out_packets) {
-      head_bytes = 4 + critical_packets * 4;  // Packet count field and the packet size fields.
+      head_bytes = 4 + mask_bytes + critical_packets * 4;  // Packet count field, mask, packet size fields.
       for (size_t i = 0; i < critical_packets; i++) {
         head_bytes += impl.packets[i].size;
       }
@@ -1165,7 +1206,7 @@ namespace platf::pyrowave {
     // Reserve the exact framed size before writing. The caller hands in a fresh vector every
     // frame, so without the reservation the per-packet inserts would grow it geometrically and
     // copy the whole bitstream several times over in the process.
-    size_t framed_size = 4 + out_packets * 4;  // Packet count field and the packet size fields.
+    size_t framed_size = 4 + mask_bytes + out_packets * 4;
     for (size_t i = 0; i < out_packets; i++) {
       framed_size += impl.packets[i].size;
     }
@@ -1173,6 +1214,12 @@ namespace platf::pyrowave {
 
     out.clear();
     put_u32((uint32_t) out_packets);
+    if (impl.active_block_sideband) {
+      put_u32((uint32_t) impl.active_mask.size());
+      for (uint32_t word : impl.active_mask) {
+        put_u32(word);
+      }
+    }
     for (size_t i = 0; i < out_packets; i++) {
       put_u32((uint32_t) impl.packets[i].size);
       const uint8_t *src = impl.scratch.data() + impl.packets[i].offset;

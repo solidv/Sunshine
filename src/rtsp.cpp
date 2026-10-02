@@ -924,8 +924,13 @@ namespace rtsp_stream {
 
     std::stringstream ss;
 
-    // Tell the client about our supported features
-    ss << "a=x-ss-general.featureFlags:" << (uint32_t) platf::get_capabilities() << std::endl;
+    // Tell the client about our supported features. The PyroWave active-block sideband is a
+    // protocol extension of this build rather than a platform capability, so it is ORed in here.
+    auto capabilities = platf::get_capabilities();
+#ifdef SUNSHINE_ENABLE_PYROWAVE
+    capabilities |= platf::platform_caps::pyrowave_active_block_mask;
+#endif
+    ss << "a=x-ss-general.featureFlags:" << (uint32_t) capabilities << std::endl;
 
     // Always request new control stream encryption if the client supports it
     uint32_t encryption_flags_supported = SS_ENC_CONTROL_V2 | SS_ENC_AUDIO;
@@ -1204,6 +1209,10 @@ namespace rtsp_stream {
       config.monitor.dynamicRange = (int) util::from_view(args.at("x-nv-video[0].dynamicRangeMode"sv));
       config.monitor.chromaSamplingType = (int) util::from_view(args.at("x-ss-video[0].chromaSamplingType"sv));
       config.monitor.enableIntraRefresh = (int) util::from_view(args.at("x-ss-video[0].intraRefresh"sv));
+
+      // The client only requests the PyroWave active-block sideband after seeing the host capability
+      // in x-ss-general.featureFlags, so honoring the request keeps older hosts/clients unambiguous.
+      config.monitor.pyrowaveActiveBlockSideband = (config.mlFeatureFlags & ML_FF_PYROWAVE_ACTIVE_BLOCK_MASK) != 0;
 
       configuredBitrateKbps = util::from_view(args.at("x-ml-video.configuredBitrateKbps"sv));
     } catch (std::out_of_range &) {

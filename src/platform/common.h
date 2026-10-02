@@ -406,6 +406,15 @@ namespace platf {
      * @brief Capability bit indicating controller touchpad and motion support.
      */
     constexpr caps_t controller_touch = 0x02;  // Controller touch and motion events
+    /**
+     * @brief Capability bit indicating support for the PyroWave active-block sideband.
+     *
+     * Advertised in `x-ss-general.featureFlags`; a client that understands the sideband asks for
+     * it back in `x-ml-general.featureFlags` (`ML_FF_PYROWAVE_ACTIVE_BLOCK_MASK`), after which the
+     * host lists the transmitted blocks of each PyroWave frame's FEC-protected bands. The value
+     * must match the client's host-feature bit (LI_FF_*).
+     */
+    constexpr caps_t pyrowave_active_block_mask = 0x04;  // PyroWave active-block sideband
   };  // namespace platform_caps
 
   /**

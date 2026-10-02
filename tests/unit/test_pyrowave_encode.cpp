@@ -30,6 +30,7 @@
   #include <cstdint>
   #include <cstring>
   #include <optional>
+  #include <utility>
   #include <vector>
 
   // lib includes
@@ -228,12 +229,16 @@ namespace {
   /**
    * @brief Decode the framed PyroWave bitstream produced by the encoder.
    *
-   * @param bitstream Framed bitstream: [u32 packet count] { [u32 size] [bytes] } * count.
+   * @param bitstream Framed bitstream: [u32 packet count] { [u32 size] [bytes] } * count, with an
+   *                  optional [u32 mask words] [words] header after the packet count when
+   *                  @p has_active_block_mask is set.
    * @param width Stream width the bitstream was encoded with.
    * @param height Stream height the bitstream was encoded with.
+   * @param has_active_block_mask True when the framing includes the active-block mask header.
+   * @param active_mask_out Optional receiver for the parsed active-block mask words.
    * @return Decoded planes, or std::nullopt when the frame could not be decoded.
    */
-  std::optional<decoded_frame_t> decode_bitstream(const std::vector<uint8_t> &bitstream, int width, int height) {
+  std::optional<decoded_frame_t> decode_bitstream(const std::vector<uint8_t> &bitstream, int width, int height, bool has_active_block_mask = false, std::vector<uint32_t> *active_mask_out = nullptr) {
     pyrowave_device device = nullptr;
     if (pyrowave_create_device_by_compat(0, 0, nullptr, nullptr, nullptr, &device) != PYROWAVE_SUCCESS) {
       return std::nullopt;
@@ -271,6 +276,22 @@ namespace {
     size_t offset = 0;
     bool ok = read_u32(offset, packet_count) && packet_count > 0;
     offset += sizeof(uint32_t);
+
+    std::vector<uint32_t> active_mask;
+    if (ok && has_active_block_mask) {
+      uint32_t mask_words = 0;
+      ok = read_u32(offset, mask_words) && offset + sizeof(uint32_t) + (size_t) mask_words * sizeof(uint32_t) <= bitstream.size();
+      offset += sizeof(uint32_t);
+      active_mask.resize(mask_words);
+      for (uint32_t word = 0; ok && word < mask_words; ++word) {
+        ok = read_u32(offset, active_mask[word]);
+        offset += sizeof(uint32_t);
+      }
+    }
+    if (active_mask_out) {
+      *active_mask_out = std::move(active_mask);
+    }
+
     for (uint32_t packet = 0; ok && packet < packet_count; ++packet) {
       uint32_t size = 0;
       ok = read_u32(offset, size) && offset + sizeof(uint32_t) + size <= bitstream.size();
@@ -328,8 +349,10 @@ namespace {
    * @param modifier DRM modifier to advertise for the minted buffer; the default takes the
    * modifier-less import path (imported as linear), while a real modifier takes that capture's
    * external image path.
+   * @param active_block_sideband True to negotiate the active-block sideband and require the mask
+   * header in the framed output.
    */
-  void expect_solid_colour_round_trip(uint32_t fourcc, uint32_t pixel, uint8_t expected_y, uint8_t expected_cb, uint8_t expected_cr, bool ten_bit, uint64_t modifier = DRM_FORMAT_MOD_INVALID) {
+  void expect_solid_colour_round_trip(uint32_t fourcc, uint32_t pixel, uint8_t expected_y, uint8_t expected_cb, uint8_t expected_cr, bool ten_bit, uint64_t modifier = DRM_FORMAT_MOD_INVALID, bool active_block_sideband = false) {
     if (!platf::pyrowave::validate()) {
       GTEST_SKIP() << "No PyroWave-capable Vulkan device";
     }
@@ -347,7 +370,7 @@ namespace {
     img.sd.modifier = modifier;
     ASSERT_GE(img.sd.fds[0], 0);
 
-    auto encoder = platf::pyrowave::encoder_t::create(image_width, image_height, encode_bitrate_kbps, encode_frame_rate, false, ten_bit, false);
+    auto encoder = platf::pyrowave::encoder_t::create(image_width, image_height, encode_bitrate_kbps, encode_frame_rate, false, ten_bit, false, active_block_sideband);
     ASSERT_NE(encoder, nullptr) << "PyroWave encoder creation failed";
 
     std::vector<uint8_t> bitstream;
@@ -355,11 +378,24 @@ namespace {
     ASSERT_EQ(encoder->encode(img, bitstream, head_bytes), 0);
     EXPECT_FALSE(bitstream.empty());
     // A flat frame is all "critical" bands, so the encoder is expected to report either no split
-    // or a split inside the frame, never an offset past the end.
+    // or a split inside the frame, never an offset past the end. A negotiated mask must fit in it.
     EXPECT_LE(head_bytes, bitstream.size());
+    if (active_block_sideband && head_bytes > 0) {
+      EXPECT_GE(head_bytes, 4 + 4);  // Packet count and mask word count are protected.
+    }
 
-    auto frame = decode_bitstream(bitstream, image_width, image_height);
+    std::vector<uint32_t> active_mask;
+    auto frame = decode_bitstream(bitstream, image_width, image_height, active_block_sideband, active_block_sideband ? &active_mask : nullptr);
     ASSERT_TRUE(frame.has_value()) << "PyroWave decoder could not decode the encoded frame";
+
+    if (active_block_sideband) {
+      // The mask header is always present when negotiated; a real image has active coarse blocks.
+      ASSERT_FALSE(active_mask.empty()) << "negotiated sideband must emit a mask";
+      EXPECT_TRUE(std::ranges::any_of(active_mask, [](uint32_t word) {
+        return word != 0;
+      }))
+        << "mask must mark the transmitted coarse blocks";
+    }
 
     const int cx = image_width / 2;
     const int cy = image_height / 2;
@@ -416,6 +452,12 @@ TEST(PyroWaveEncodeDmaBufTest, EncodesSolidRedFrom10BitModifierDmaBuf) {
   expect_solid_colour_round_trip(DRM_FORMAT_XBGR2101010, 0x000003ffu, 54, 99, 255, true, DRM_FORMAT_MOD_LINEAR);
 }
 
+TEST(PyroWaveEncodeDmaBufTest, CarriesActiveBlockMaskWhenNegotiated) {
+  // The client requested the sideband, so the framing must carry the mask header in addition to
+  // the packets, the mask must mark the transmitted coarse blocks, and the frame must still decode.
+  expect_solid_colour_round_trip(DRM_FORMAT_ARGB8888, 0xffff0000u, 54, 99, 255, false, DRM_FORMAT_MOD_INVALID, true);
+}
+
 TEST(PyroWaveEncodeDmaBufTest, CenterCropsSourceToStreamAspect) {
   // A 256x256 source encoded into a 256x128 stream. PyroWave's scaler always fills the encoder
   // frame, so the wrapper center-crops the source (rows 64..191) instead of stretching it. Only
@@ -444,7 +486,7 @@ TEST(PyroWaveEncodeDmaBufTest, CenterCropsSourceToStreamAspect) {
 
   constexpr int stream_width = image_width;
   constexpr int stream_height = image_height / 2;
-  auto encoder = platf::pyrowave::encoder_t::create(stream_width, stream_height, encode_bitrate_kbps, encode_frame_rate, false, false, false);
+  auto encoder = platf::pyrowave::encoder_t::create(stream_width, stream_height, encode_bitrate_kbps, encode_frame_rate, false, false, false, false);
   ASSERT_NE(encoder, nullptr) << "PyroWave encoder creation failed";
 
   std::vector<uint8_t> bitstream;

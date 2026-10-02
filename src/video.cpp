@@ -2557,7 +2557,7 @@ namespace video {
     // additionally requires the display to actually be in HDR mode (else SDR content is carried in
     // the 10-bit containers and the client presents it as SDR).
     bool ten_bit = config.dynamicRange == 1;
-    auto encoder = platf::pyrowave::encoder_t::create(config.width, config.height, config.bitrate, config.framerate, config.chromaSamplingType == 1, ten_bit, ten_bit && disp->is_hdr());
+    auto encoder = platf::pyrowave::encoder_t::create(config.width, config.height, config.bitrate, config.framerate, config.chromaSamplingType == 1, ten_bit, ten_bit && disp->is_hdr(), config.pyrowaveActiveBlockSideband);
     if (!encoder) {
       BOOST_LOG(error) << "Failed to create PyroWave encoder"sv;
       return;
