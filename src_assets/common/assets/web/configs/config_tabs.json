@@ -96,6 +96,8 @@
     "nameKey": "config.category_advanced",
     "options": {
       "fec_percentage": 20,
+      "pacing_percent": 80,
+      "pyrowave_pacing_percent": 0,
       "qp": 28,
       "min_threads": 2,
       "hevc_mode": 0,

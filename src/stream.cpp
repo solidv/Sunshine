@@ -1000,6 +1000,33 @@ namespace stream {
   }
 
   /**
+   * @brief Convert the configured pacing percentage into a packets-per-millisecond budget.
+   *
+   * Pacing spreads a frame's shards over time by holding each send batch back until the
+   * configured number of packets could have left a 1 Gbps link. A percentage of 0 disables
+   * pacing and is reported as 0 packets/ms, letting the caller send as fast as the socket allows.
+   *
+   * @param percentage Pacing rate as a percentage of 1 Gbps, or 0 to disable pacing.
+   * @param blocksize Bytes per packet, including the RTP and video headers.
+   * @return Packets allowed per millisecond, or 0 when pacing is disabled.
+   */
+  size_t ratecontrol_packets_per_ms(const int percentage, const size_t blocksize) {
+    if (percentage <= 0 || blocksize == 0) {
+      return 0;
+    }
+
+    const size_t packets = (size_t) (std::giga::num * percentage / 100 / 1000 / blocksize / 8);
+
+    // Very low percentages with a large packet size round down to zero; keep one packet per
+    // millisecond so callers never divide by zero.
+    return std::max<size_t>(packets, 1);
+  }
+
+  int pacing_percent_for_codec(bool is_pyrowave, int pacing_percent, int pyrowave_pacing_percent) {
+    return is_pyrowave ? pyrowave_pacing_percent : pacing_percent;
+  }
+
+  /**
    * @brief Combines two buffers and inserts new buffers at each slice boundary of the result.
    * @param insert_size The number of bytes to insert.
    * @param slice_size The number of bytes between insertions.
@@ -1749,8 +1776,12 @@ namespace stream {
       BOOST_LOG(verbose) << "Generating "sv << fec_blocks_needed << " FEC blocks"sv;
 
       try {
-        // Use around 80% of 1Gbps          1Gbps            percent    ms     packet      byte
-        size_t ratecontrol_packets_in_1ms = std::giga::num * 80 / 100 / 1000 / blocksize / 8;
+        // Pace to a percentage of 1 Gbps. PyroWave uses its own setting because its large intra
+        // frames would otherwise spend a noticeable part of the frame interval draining, adding
+        // transmit time to every frame's latency. Setting the percentage to 0 disables
+        // intra-frame pacing and sends each frame as fast as the link allows.
+        const auto pacing_percent = pacing_percent_for_codec(session->config.monitor.videoFormat == video::PYROWAVE_BITSTREAM_FORMAT, config::stream.pacing_percent, config::stream.pyrowave_pacing_percent);
+        const size_t ratecontrol_packets_in_1ms = ratecontrol_packets_per_ms(pacing_percent, blocksize);
 
         // Send less than 64K in a single batch.
         // On Windows, batches above 64K seem to bypass SO_SNDBUF regardless of its size,
@@ -1865,7 +1896,8 @@ namespace stream {
               // Do pacing within the frame.
               // Also trigger pacing before the first send_batch() of the frame
               // to account for the last send_batch() of the previous frame.
-              if (ratecontrol_group_packets_sent >= ratecontrol_packets_in_1ms || ratecontrol_frame_packets_sent == 0) {
+              if (ratecontrol_packets_in_1ms != 0 &&
+                  (ratecontrol_group_packets_sent >= ratecontrol_packets_in_1ms || ratecontrol_frame_packets_sent == 0)) {
                 auto due = ratecontrol_frame_start +
                            std::chrono::duration_cast<std::chrono::nanoseconds>(1ms) *
                              ratecontrol_frame_packets_sent / ratecontrol_packets_in_1ms;
@@ -1910,10 +1942,14 @@ namespace stream {
             }
           }
 
-          // remember this in case the next frame comes immediately
-          ratecontrol_next_frame_start = ratecontrol_frame_start +
-                                         std::chrono::duration_cast<std::chrono::nanoseconds>(1ms) *
-                                           ratecontrol_frame_packets_sent / ratecontrol_packets_in_1ms;
+          // Remember this in case the next frame comes immediately.
+          if (ratecontrol_packets_in_1ms != 0) {
+            ratecontrol_next_frame_start = ratecontrol_frame_start +
+                                           std::chrono::duration_cast<std::chrono::nanoseconds>(1ms) *
+                                             ratecontrol_frame_packets_sent / ratecontrol_packets_in_1ms;
+          } else {
+            ratecontrol_next_frame_start = std::chrono::steady_clock::now();
+          }
 
           frame_network_latency_logger.second_point_now_and_log();
 

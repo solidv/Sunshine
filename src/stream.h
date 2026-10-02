@@ -41,6 +41,20 @@ namespace stream {
     std::optional<int> gcmap;  ///< Optional game-controller mapping override from the launch request.
   };
 
+  /**
+   * @brief Select the intra-frame pacing percentage to use for a session's codec.
+   *
+   * PyroWave sends large intra-only frames over high-bandwidth links, where spreading a frame
+   * over time only delays its last packets, so it has its own pacing setting that defaults to 0
+   * (unpaced). Every other codec uses the generic pacing percentage.
+   *
+   * @param is_pyrowave True when the session negotiated the PyroWave codec.
+   * @param pacing_percent Configured pacing percentage for non-PyroWave codecs.
+   * @param pyrowave_pacing_percent Configured pacing percentage for PyroWave sessions.
+   * @return Pacing rate as a percentage of 1 Gbps; 0 disables pacing.
+   */
+  int pacing_percent_for_codec(bool is_pyrowave, int pacing_percent, int pyrowave_pacing_percent);
+
   namespace session {
     /**
      * @brief Enumerates supported state options.

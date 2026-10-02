@@ -2057,6 +2057,69 @@ consent prompt for directory ACLs, so the Web UI shows setup steps for correctin
     </tr>
 </table>
 
+### pacing_percent
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Intra-frame send pacing as a percentage of 1 Gbps. Pacing spreads each frame's
+            packets over time instead of sending them as one burst. A value of 0 disables
+            pacing and sends each frame as fast as the link allows, which can reduce latency
+            on a dedicated network.
+            @note{PyroWave sessions use @code{}pyrowave_pacing_percent@endcode instead.}
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            80
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Range</td>
+        <td colspan="2">0-100</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            pacing_percent = 0
+            @endcode</td>
+    </tr>
+</table>
+
+### pyrowave_pacing_percent
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Intra-frame send pacing for PyroWave sessions as a percentage of 1 Gbps. PyroWave sends
+            large intra-only frames, so pacing delays the last packets of every frame and adds that
+            delay to its latency. A value of 0 (default) sends each frame as fast as the link allows,
+            matching the reference PyroWave implementation. Raise it only if the stream overwhelms a
+            slower or congested link.
+            @note{Applies to Linux only, together with @code{}pyrowave_mode@endcode.}
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            0
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Range</td>
+        <td colspan="2">0-100</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            pyrowave_pacing_percent = 80
+            @endcode</td>
+    </tr>
+</table>
+
 ### qp
 
 <table>

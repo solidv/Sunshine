@@ -23,6 +23,8 @@ namespace stream {
   std::vector<uint8_t> concat_and_insert(uint64_t insert_size, uint64_t slice_size, const std::string_view &data1, const std::string_view &data2);
   std::optional<std::pair<std::uint16_t, std::string_view>> parse_control_packet(const ENetPacket &packet);
   int split_fec_blocks_head_tail(const std::string_view &payload, size_t blocksize, size_t payload_blocksize, size_t head_stream_bytes, std::array<std::string_view, 4> &blocks, std::array<int, 4> &percentages);
+  size_t ratecontrol_packets_per_ms(const int percentage, const size_t blocksize);
+  int pacing_percent_for_codec(bool is_pyrowave, int pacing_percent, int pyrowave_pacing_percent);
 }  // namespace stream
 
 TEST(ConcatAndInsertTests, ConcatNoInsertionTest) {
@@ -174,4 +176,39 @@ TEST(SplitFecBlocksHeadTailTests, RejectsTailBeyondShardLimit) {
 
   // An 895-packet tail would need five FEC blocks, more than the protocol can describe.
   EXPECT_EQ(stream::split_fec_blocks_head_tail(payload, test_blocksize, test_payload_blocksize, test_payload_blocksize * 5, blocks, percentages), 0);
+}
+
+TEST(RatecontrolPacketsPerMsTests, DisabledTest) {
+  // 0 disables intra-frame pacing entirely.
+  EXPECT_EQ(stream::ratecontrol_packets_per_ms(0, 1408), 0);
+}
+
+TEST(RatecontrolPacketsPerMsTests, DefaultPercentageTest) {
+  // 80% of 1 Gbps at 1408-byte packets matches the historical hardcoded rate.
+  EXPECT_EQ(stream::ratecontrol_packets_per_ms(80, 1408), 71);
+}
+
+TEST(RatecontrolPacketsPerMsTests, HigherPercentagesTest) {
+  EXPECT_EQ(stream::ratecontrol_packets_per_ms(95, 1408), 84);
+  EXPECT_EQ(stream::ratecontrol_packets_per_ms(100, 1408), 88);
+}
+
+TEST(PacingPercentForCodecTests, PyroWaveUsesItsOwnSetting) {
+  // PyroWave is unpaced by default even though regular sessions keep the generic percentage.
+  EXPECT_EQ(stream::pacing_percent_for_codec(true, 80, 0), 0);
+  EXPECT_EQ(stream::pacing_percent_for_codec(true, 80, 40), 40);
+}
+
+TEST(PacingPercentForCodecTests, OtherCodecsUseTheGenericSetting) {
+  EXPECT_EQ(stream::pacing_percent_for_codec(false, 80, 0), 80);
+  EXPECT_EQ(stream::pacing_percent_for_codec(false, 0, 40), 0);
+}
+
+TEST(RatecontrolPacketsPerMsTests, NeverReturnsZeroWhileEnabledTest) {
+  // Very low percentages with a large packet size round down, but callers divide by this value.
+  EXPECT_EQ(stream::ratecontrol_packets_per_ms(1, 1408), 1);
+}
+
+TEST(RatecontrolPacketsPerMsTests, ZeroBlocksizeTest) {
+  EXPECT_EQ(stream::ratecontrol_packets_per_ms(80, 0), 0);
 }
