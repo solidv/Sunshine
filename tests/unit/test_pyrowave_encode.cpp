@@ -452,6 +452,99 @@ TEST(PyroWaveEncodeDmaBufTest, EncodesSolidRedFrom10BitModifierDmaBuf) {
   expect_solid_colour_round_trip(DRM_FORMAT_XBGR2101010, 0x000003ffu, 54, 99, 255, true, DRM_FORMAT_MOD_LINEAR);
 }
 
+TEST(PyroWaveEncodeDmaBufTest, ReusesTheImportOfACapturedBuffer) {
+  // Capture buffers come back frame after frame, so the encoder caches their imports. A reused
+  // buffer must still encode its current contents, not the contents of the cached frame.
+  if (!platf::pyrowave::validate()) {
+    GTEST_SKIP() << "No PyroWave-capable Vulkan device";
+  }
+
+  gbm_buffer_t buffer;
+  if (!buffer.create(DRM_FORMAT_ARGB8888)) {
+    GTEST_SKIP() << "No render node available that can mint a DMA-BUF of the requested format";
+  }
+
+  egl::img_descriptor_t img;
+  fill_image_descriptor(buffer, img);
+  img.sd.modifier = DRM_FORMAT_MOD_LINEAR;  // The external image path, where imports are cached.
+  ASSERT_GE(img.sd.fds[0], 0);
+
+  auto encoder = platf::pyrowave::encoder_t::create(image_width, image_height, encode_bitrate_kbps, encode_frame_rate, false, false, false, false, 1392);
+  ASSERT_NE(encoder, nullptr) << "PyroWave encoder creation failed";
+
+  const int cx = image_width / 2;
+  const int cy = image_height / 2;
+  std::vector<uint8_t> bitstream;
+  size_t head_bytes = 0;
+
+  // First frame: the buffer is solid red.
+  ASSERT_TRUE(fill_solid(buffer.bo, 0xffff0000u));
+  ASSERT_EQ(encoder->encode(img, bitstream, head_bytes), 0);
+  auto red = decode_bitstream(bitstream, image_width, image_height, false, nullptr);
+  ASSERT_TRUE(red.has_value()) << "PyroWave decoder could not decode the encoded frame";
+  EXPECT_NEAR(red->luma_at(cx, cy), 54, colour_tolerance);
+  EXPECT_NEAR(red->cb_at(cx, cy), 99, colour_tolerance);
+  EXPECT_NEAR(red->cr_at(cx, cy), 255, colour_tolerance);
+
+  // Second frame from the same buffer, now solid blue: the reused import must read the new pixels.
+  ASSERT_TRUE(fill_solid(buffer.bo, 0xff0000ffu));
+  bitstream.clear();
+  ASSERT_EQ(encoder->encode(img, bitstream, head_bytes), 0);
+  auto blue = decode_bitstream(bitstream, image_width, image_height, false, nullptr);
+  ASSERT_TRUE(blue.has_value()) << "PyroWave decoder could not decode the encoded frame";
+  EXPECT_NEAR(blue->luma_at(cx, cy), 18, colour_tolerance);
+  EXPECT_NEAR(blue->cb_at(cx, cy), 255, colour_tolerance);
+  EXPECT_NEAR(blue->cr_at(cx, cy), 116, colour_tolerance);
+}
+
+TEST(PyroWaveEncodeDmaBufTest, ReimportsBuffersEvictedFromTheImportCache) {
+  // The import cache is bounded, and a buffer that fell out of it must be importable again.
+  if (!platf::pyrowave::validate()) {
+    GTEST_SKIP() << "No PyroWave-capable Vulkan device";
+  }
+
+  // One more buffer than the cache holds, so the first buffer's import is evicted.
+  constexpr size_t distinct_buffers = 9;
+  std::array<gbm_buffer_t, distinct_buffers> buffers;
+  for (auto &buffer : buffers) {
+    if (!buffer.create(DRM_FORMAT_ARGB8888)) {
+      GTEST_SKIP() << "No render node available that can mint a DMA-BUF of the requested format";
+    }
+    if (!fill_solid(buffer.bo, 0xffffffffu)) {
+      GTEST_SKIP() << "DMA-BUF could not be mapped for writing";
+    }
+  }
+
+  auto encoder = platf::pyrowave::encoder_t::create(image_width, image_height, encode_bitrate_kbps, encode_frame_rate, false, false, false, false, 1392);
+  ASSERT_NE(encoder, nullptr) << "PyroWave encoder creation failed";
+
+  for (auto &buffer : buffers) {
+    egl::img_descriptor_t img;
+    fill_image_descriptor(buffer, img);
+    img.sd.modifier = DRM_FORMAT_MOD_LINEAR;
+    ASSERT_GE(img.sd.fds[0], 0);
+
+    std::vector<uint8_t> bitstream;
+    size_t head_bytes = 0;
+    ASSERT_EQ(encoder->encode(img, bitstream, head_bytes), 0);
+  }
+
+  // The first buffer's import was evicted above; re-encode it with new contents.
+  ASSERT_TRUE(fill_solid(buffers[0].bo, 0xff0000ffu));
+  egl::img_descriptor_t img;
+  fill_image_descriptor(buffers[0], img);
+  img.sd.modifier = DRM_FORMAT_MOD_LINEAR;
+  ASSERT_GE(img.sd.fds[0], 0);
+
+  std::vector<uint8_t> bitstream;
+  size_t head_bytes = 0;
+  ASSERT_EQ(encoder->encode(img, bitstream, head_bytes), 0);
+  auto frame = decode_bitstream(bitstream, image_width, image_height, false, nullptr);
+  ASSERT_TRUE(frame.has_value()) << "PyroWave decoder could not decode the encoded frame";
+  EXPECT_NEAR(frame->luma_at(image_width / 2, image_height / 2), 18, colour_tolerance);
+  EXPECT_NEAR(frame->cb_at(image_width / 2, image_height / 2), 255, colour_tolerance);
+}
+
 TEST(PyroWaveEncodeDmaBufTest, CarriesActiveBlockMaskWhenNegotiated) {
   // The client requested the sideband, so the framing must carry the mask header in addition to
   // the packets, the mask must mark the transmitted coarse blocks, and the frame must still decode.

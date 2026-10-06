@@ -7,6 +7,7 @@
   // The include order below is deliberate: pyrowave.h fails to compile unless the Vulkan headers
   // were included first, and clang-format would otherwise sort the quoted includes ahead of them.
   // clang-format off
+  #include <algorithm>
   #include <array>
   #include <cstring>
   #include <functional>
@@ -588,7 +589,8 @@ namespace platf::pyrowave {
     bool logged_mask_failure = false;
 
     /// PyroWave-owned external image (fast path). When null, the manually imported linear image
-    /// below is in use instead.
+    /// below is in use instead. The image is owned by the import cache (pimg_cached) or by the
+    /// current frame; release_capture() ends its use for the frame either way.
     pyrowave_image pimg = nullptr;
 
     /// True when PyroWave was created for an async-compute encode queue (high-priority request
@@ -614,6 +616,61 @@ namespace platf::pyrowave {
     VkImage imp_image = VK_NULL_HANDLE;  ///< Imported captured buffer.
     VkDeviceMemory imp_mem = VK_NULL_HANDLE;  ///< Memory exported by the captured buffer.
 
+    /// Planes reported for a (format, modifier) pair, memoized because query_modifier_plane_count()
+    /// enumerates every modifier the device reports and the capture format is fixed per session.
+    struct modifier_plane_count_t {
+      VkFormat format {};  ///< Format the count was queried for.
+      uint64_t modifier = 0;  ///< DRM format modifier the count was queried for.
+      int planes = 0;  ///< Plane count reported for the pair.
+    };
+
+    /// Memoized query_modifier_plane_count() results, see modifier_plane_count().
+    std::vector<modifier_plane_count_t> modifier_plane_counts;
+
+    /// Number of capture imports kept alive for reuse. Captures cycle through the compositor's
+    /// buffer pool, which is a handful of buffers.
+    static constexpr size_t import_cache_capacity = 8;
+
+    /// Identity of a captured DMA-BUF for as long as a descriptor to it stays open.
+    struct import_cache_key_t {
+      uint64_t dev = 0;  ///< st_dev of the captured descriptor.
+      uint64_t ino = 0;  ///< st_ino of the captured descriptor.
+      uint64_t modifier = 0;  ///< DRM format modifier of the buffer.
+      VkFormat format {};  ///< Vulkan format the buffer is imported as.
+      int width = 0;  ///< Buffer width.
+      int height = 0;  ///< Buffer height.
+
+      /**
+       * @brief Compare two capture identities.
+       *
+       * @param other Identity to compare against.
+       * @return True when both describe the same buffer.
+       */
+      bool operator==(const import_cache_key_t &other) const {
+        return dev == other.dev && ino == other.ino && modifier == other.modifier &&
+               format == other.format && width == other.width && height == other.height;
+      }
+    };
+
+    /// One reusable capture import.
+    struct import_cache_entry_t {
+      import_cache_key_t key {};  ///< Identity of the cached buffer.
+      int held_fd = -1;  ///< Descriptor pinning the buffer's identity (dev/ino) while cached.
+      pyrowave_image image = nullptr;  ///< PyroWave-owned import handed to the encoder per frame.
+      uint64_t last_used = 0;  ///< Import clock tick of the most recent use, for LRU eviction.
+    };
+
+    /// Reused imports of the capture's DMA-BUFs. Importing a buffer (image creation, memory
+    /// binding, and the driver's address setup) is the expensive part of the external image path,
+    /// and a capture buffer comes back frame after frame, so the import is kept and reused.
+    std::vector<import_cache_entry_t> import_cache;
+
+    /// Monotonic tick stamped into import cache entries to order them by recency.
+    uint64_t import_cache_clock = 0;
+
+    /// True while pimg refers to an import owned by the cache, which must outlive this frame.
+    bool pimg_cached = false;
+
     ~impl_t() {
       if (enc) {
         pyrowave_encoder_destroy(enc);
@@ -622,6 +679,7 @@ namespace platf::pyrowave {
       if (vk_dev) {
         vkDeviceWaitIdle(vk_dev);
         release_capture();
+        clear_cached_imports();
         if (vk_fence) {
           vkDestroyFence(vk_dev, vk_fence, nullptr);
         }
@@ -702,7 +760,7 @@ namespace platf::pyrowave {
       for (int i = 0; i < 4 && sd.fds[i] >= 0; ++i) {
         dmabuf_planes++;
       }
-      int expected = query_modifier_plane_count(vk_phys, vk_format, modifier);
+      int expected = modifier_plane_count(vk_format, modifier);
       int plane_count = (expected > 0 && expected <= dmabuf_planes) ? expected : dmabuf_planes;
 
       std::array<VkSubresourceLayout, 4> drm_layouts = {};
@@ -744,6 +802,133 @@ namespace platf::pyrowave {
     }
 
     /**
+     * @brief Memoized query of how many planes a format/modifier pair uses.
+     *
+     * @param format Vulkan format of the image.
+     * @param modifier DRM format modifier describing the buffer layout.
+     * @return Plane count reported for the modifier, or 0 when the modifier is unsupported.
+     */
+    int modifier_plane_count(VkFormat format, uint64_t modifier) {
+      for (const auto &entry : modifier_plane_counts) {
+        if (entry.format == format && entry.modifier == modifier) {
+          return entry.planes;
+        }
+      }
+      const int planes = query_modifier_plane_count(vk_phys, format, modifier);
+      modifier_plane_counts.push_back({format, modifier, planes});
+      return planes;
+    }
+
+    /**
+     * @brief Destroy one cached import: the image and the descriptor pinning its identity.
+     *
+     * @param entry Entry to destroy.
+     */
+    static void destroy_cached_import(import_cache_entry_t &entry) {
+      if (entry.image) {
+        pyrowave_image_destroy(entry.image);
+        entry.image = nullptr;
+      }
+      if (entry.held_fd >= 0) {
+        close(entry.held_fd);
+        entry.held_fd = -1;
+      }
+    }
+
+    /**
+     * @brief Destroy every cached import. The device must still be alive.
+     */
+    void clear_cached_imports() {
+      for (auto &entry : import_cache) {
+        destroy_cached_import(entry);
+      }
+      import_cache.clear();
+    }
+
+    /**
+     * @brief Drop the least-recently-used cached import.
+     */
+    void evict_cached_import() {
+      if (import_cache.empty()) {
+        return;
+      }
+      auto lru = std::min_element(import_cache.begin(), import_cache.end(), [](const import_cache_entry_t &a, const import_cache_entry_t &b) {
+        return a.last_used < b.last_used;
+      });
+      destroy_cached_import(*lru);
+      import_cache.erase(lru);
+    }
+
+    /**
+     * @brief Derive the identity of a captured DMA-BUF.
+     *
+     * The descriptor's device/inode pair identifies the buffer while a descriptor to it stays
+     * open, which the cache guarantees by holding one. Captures without a descriptor, or whose
+     * stat fails, cannot be cached.
+     *
+     * @param sd Surface descriptor of the captured buffer.
+     * @param key Receives the identity.
+     * @return True when the buffer can be identified.
+     */
+    static bool capture_import_key(const egl::surface_descriptor_t &sd, import_cache_key_t &key) {
+      struct stat st {};
+      if (sd.fds[0] < 0 || fstat(sd.fds[0], &st) != 0) {
+        return false;
+      }
+      key = {};
+      key.dev = (uint64_t) st.st_dev;
+      key.ino = (uint64_t) st.st_ino;
+      key.modifier = (sd.modifier == DRM_FORMAT_MOD_INVALID) ? DRM_FORMAT_MOD_LINEAR : sd.modifier;
+      key.format = drm_fourcc_to_vk_format(sd.fourcc);
+      key.width = sd.width;
+      key.height = sd.height;
+      return true;
+    }
+
+    /**
+     * @brief Import the captured buffer through PyroWave, reusing the import when it is cached.
+     *
+     * @param sd Surface descriptor of the captured buffer.
+     * @return True on success; the import is owned by the cache, or by this frame when the buffer
+     *         cannot be identified, and ends with release_capture() either way.
+     */
+    bool import_captured(const egl::surface_descriptor_t &sd) {
+      import_cache_key_t key {};
+      if (!capture_import_key(sd, key)) {
+        return create_pyrowave_image(sd);
+      }
+
+      import_cache_clock++;
+      for (auto &entry : import_cache) {
+        if (entry.key == key) {
+          entry.last_used = import_cache_clock;
+          pimg = entry.image;
+          pimg_cached = true;
+          return true;
+        }
+      }
+
+      const int held_fd = dup(sd.fds[0]);
+      if (!create_pyrowave_image(sd)) {
+        if (held_fd >= 0) {
+          close(held_fd);
+        }
+        return false;
+      }
+
+      if (held_fd < 0) {
+        return true;  // The identity could not be pinned, so this frame owns the import.
+      }
+
+      if (import_cache.size() >= import_cache_capacity) {
+        evict_cached_import();
+      }
+      import_cache.push_back({key, held_fd, pimg, import_cache_clock});
+      pimg_cached = true;
+      return true;
+    }
+
+    /**
      * @brief Release the per-frame imported capture image.
      */
     void destroy_import() {
@@ -759,9 +944,15 @@ namespace platf::pyrowave {
 
     /**
      * @brief Release whichever capture import is currently held.
+     *
+     * Imports owned by the reuse cache outlive the frame and stay cached; only one-shot imports
+     * (uncacheable external imports and manual imports) are destroyed here.
      */
     void release_capture() {
-      if (pimg) {
+      if (pimg_cached) {
+        pimg_cached = false;
+        pimg = nullptr;  // Still owned by the import cache.
+      } else if (pimg) {
         pyrowave_image_destroy(pimg);
         pimg = nullptr;
       }
@@ -772,20 +963,23 @@ namespace platf::pyrowave {
      * @brief Make the captured DMA-BUF sampleable by the GPU encode.
      *
      * Captures go through PyroWave's external image path, which lets PyroWave manage the image and
-     * its queue ownership. When that fails, captures fall back to the manual import, but only when
-     * PyroWave encodes on the default (graphics/compute) queue: an async-compute encode family
-     * would not own an image transitioned on the manual import's queue, so the fallback is refused
-     * in that case rather than sampling across queue families.
+     * its queue ownership. Importing a buffer is the expensive part of that path and captures cycle
+     * through a small buffer pool, so imports are reused, see import_captured(). When the external
+     * path fails, captures fall back to the manual import, but only when PyroWave encodes on the
+     * default (graphics/compute) queue: an async-compute encode family would not own an image
+     * transitioned on the manual import's queue, so the fallback is refused in that case rather
+     * than sampling across queue families.
      *
      * @param desc Captured image descriptor.
      * @return True on success.
      */
     bool prepare_capture(const egl::img_descriptor_t &desc) {
       if (!external_import_disabled) {
-        if (create_pyrowave_image(desc.sd)) {
+        if (import_captured(desc.sd)) {
           return true;
         }
         external_import_disabled = true;
+        clear_cached_imports();
       }
       if (async_encode) {
         BOOST_LOG(debug) << "PyroWave: external image import unavailable on an async-compute encode device";
@@ -827,7 +1021,7 @@ namespace platf::pyrowave {
         for (int i = 0; i < 4 && sd.fds[i] >= 0; ++i) {
           dmabuf_planes++;
         }
-        int expected = query_modifier_plane_count(vk_phys, vk_format, sd.modifier);
+        int expected = modifier_plane_count(vk_format, sd.modifier);
         int plane_count = (expected > 0 && expected <= dmabuf_planes) ? expected : dmabuf_planes;
         for (int i = 0; i < plane_count; ++i) {
           drm_layouts[i].offset = sd.offsets[i];
@@ -1117,23 +1311,29 @@ namespace platf::pyrowave {
       return -1;
     }
 
-    // Captures imported through PyroWave's external image API are acquired by the encode submission
-    // itself, so no explicit import sync is needed. The manual linear import path already waited on
-    // its transition, so it passes no acquire either.
+    // Captures imported through PyroWave's external image API are acquired and released by the
+    // encode submission itself, so no explicit import sync is needed. Imports can outlive the frame
+    // (the import cache reuses them), so the release matters: it hands the image back to its
+    // external owner, which is the state the next frame's acquire expects (the external image
+    // contract in pyrowave.h). The manual linear import path already waited on its transition, so
+    // it passes neither.
     pyrowave_gpu_external_reference ext_ref {};
     pyrowave_gpu_sync_operation acquire {};
+    pyrowave_gpu_sync_operation release {};
     bool external_image = impl.pimg != nullptr;
     if (external_image) {
       ext_ref.image = impl.pimg;
       ext_ref.queue_family_index = VK_QUEUE_FAMILY_EXTERNAL;
       acquire.images = &ext_ref;
       acquire.num_images = 1;
+      release.images = &ext_ref;
+      release.num_images = 1;
     }
 
     pyrowave_rate_control rc {};
     rc.maximum_bitstream_size = impl.max_bitstream;
 
-    if (pyrowave_encoder_encode_gpu_scaled_synchronous(impl.enc, external_image ? &acquire : nullptr, nullptr, &scaling, &rc) != PYROWAVE_SUCCESS) {
+    if (pyrowave_encoder_encode_gpu_scaled_synchronous(impl.enc, external_image ? &acquire : nullptr, external_image ? &release : nullptr, &scaling, &rc) != PYROWAVE_SUCCESS) {
       impl.release_capture();
       BOOST_LOG(error) << "PyroWave: encode_gpu_scaled_synchronous failed";
       return -1;
