@@ -287,7 +287,7 @@ package() {
 
       _pyrowave_soname="$(basename "${_pyrowave_lib}")"
       install -Dm755 "${_pyrowave_lib}" "${pkgdir}/usr/lib/${_pyrowave_soname}"
-      ln -sf "${_pyrowave_soname}" "${pkgdir}/usr/lib/libpyrowave-shared.so.0"
+      ln -sf "${_pyrowave_soname}" "${pkgdir}/usr/lib/libpyrowave-shared.so.1"
 
       # Drop the development RUNPATH that points into the build tree; the library now lives in a
       # default loader search path.

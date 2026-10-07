@@ -29,7 +29,7 @@ endif()
 add_library(pyrowave_c SHARED IMPORTED)
 set_target_properties(pyrowave_c PROPERTIES
         IMPORTED_LOCATION "${PYROWAVE_SHARED}"
-        IMPORTED_SONAME "libpyrowave-shared.so.0"
+        IMPORTED_SONAME "libpyrowave-shared.so.1"
         INTERFACE_INCLUDE_DIRECTORIES "${PYROWAVE_DIR}"
         # Bake the shared-library location into the runtime search path so the binary finds it.
         INTERFACE_LINK_OPTIONS "-Wl,-rpath,${PYROWAVE_DIR}/build")

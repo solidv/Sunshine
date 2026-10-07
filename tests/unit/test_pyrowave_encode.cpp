@@ -240,7 +240,7 @@ namespace {
    */
   std::optional<decoded_frame_t> decode_bitstream(const std::vector<uint8_t> &bitstream, int width, int height, bool has_active_block_mask = false, std::vector<uint32_t> *active_mask_out = nullptr) {
     pyrowave_device device = nullptr;
-    if (pyrowave_create_device_by_compat(0, 0, nullptr, nullptr, nullptr, &device) != PYROWAVE_SUCCESS) {
+    if (pyrowave_create_device_by_compat(0, 0, nullptr, nullptr, nullptr, VK_QUEUE_GLOBAL_PRIORITY_MEDIUM_EXT, &device) != PYROWAVE_SUCCESS) {
       return std::nullopt;
     }
 

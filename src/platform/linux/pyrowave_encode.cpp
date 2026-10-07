@@ -496,7 +496,7 @@ namespace platf::pyrowave {
      */
     bool create_device_elevated(const pyrowave_uuid *device_uuid, pyrowave_device *device) {
       auto attempt = [device_uuid, device] {
-        return pyrowave_create_device_by_compat2(0, 0, device_uuid, nullptr, nullptr, VK_QUEUE_GLOBAL_PRIORITY_HIGH_EXT, device) == PYROWAVE_SUCCESS;
+        return pyrowave_create_device_by_compat(0, 0, device_uuid, nullptr, nullptr, VK_QUEUE_GLOBAL_PRIORITY_HIGH_EXT, device) == PYROWAVE_SUCCESS;
       };
 
       try {
@@ -1233,7 +1233,7 @@ namespace platf::pyrowave {
     if (create_device_elevated(uuid, &impl.pdev)) {
       impl.async_encode = true;
       priority = pyrowave_device_get_global_priority(impl.pdev);
-    } else if (pyrowave_create_device_by_compat(0, 0, uuid, nullptr, nullptr, &impl.pdev) != PYROWAVE_SUCCESS) {
+    } else if (pyrowave_create_device_by_compat(0, 0, uuid, nullptr, nullptr, VK_QUEUE_GLOBAL_PRIORITY_MEDIUM_EXT, &impl.pdev) != PYROWAVE_SUCCESS) {
       BOOST_LOG(error) << "PyroWave: pyrowave_create_device_by_compat failed";
       return nullptr;
     }
@@ -1333,9 +1333,9 @@ namespace platf::pyrowave {
     pyrowave_rate_control rc {};
     rc.maximum_bitstream_size = impl.max_bitstream;
 
-    if (pyrowave_encoder_encode_gpu_scaled_synchronous(impl.enc, external_image ? &acquire : nullptr, external_image ? &release : nullptr, &scaling, &rc) != PYROWAVE_SUCCESS) {
+    if (pyrowave_encoder_encode_gpu_scaled(impl.enc, external_image ? &acquire : nullptr, external_image ? &release : nullptr, &scaling, &rc) != PYROWAVE_SUCCESS) {
       impl.release_capture();
-      BOOST_LOG(error) << "PyroWave: encode_gpu_scaled_synchronous failed";
+      BOOST_LOG(error) << "PyroWave: encode_gpu_scaled failed";
       return -1;
     }
 
