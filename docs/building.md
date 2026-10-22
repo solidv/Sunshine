@@ -253,6 +253,35 @@ ninja -C build
 > Available build options can be found in
 > [options.cmake](https://github.com/LizardByte/Sunshine/blob/master/cmake/prep/options.cmake).
 
+### PyroWave Encoding (Optional)
+
+PyroWave is an intra-only GPU wavelet codec intended for low-latency streaming over high-bandwidth
+local networks. See the upstream [PyroWave README](https://github.com/Themaister/PyroWave) and the
+[frozen v1 bitstream specification](https://github.com/Themaister/PyroWave/blob/master/bitstream/bitstream.md)
+for the codec format. It is disabled by default. To build it on Linux, first build the vendored
+PyroWave shared library (it fetches Granite itself), then configure Sunshine with
+`-DSUNSHINE_ENABLE_PYROWAVE=ON`:
+
+```bash
+git submodule update --init third-party/pyrowave
+cd third-party/pyrowave
+./checkout_granite.sh
+cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+cmake --build build
+cd ../..
+cmake -B build -G Ninja -S . -DSUNSHINE_ENABLE_PYROWAVE=ON
+```
+
+PyroWave requires a Vulkan 1.3+ GPU (Vulkan 1.4 features are used when available),
+`SUNSHINE_ENABLE_VULKAN` (on by default), and a DMA-BUF capture path at runtime, so it must be used
+with `encoder = vulkan`.
+
+PyroWave asks for a high GPU queue priority so the encode keeps its latency budget while a game
+saturates the GPU, and Linux only grants priorities above medium to a process with `CAP_SYS_NICE`.
+Packaged installs apply `cap_sys_admin,cap_sys_nice+p` to the binary; builds run directly from the
+build tree can apply `sudo setcap cap_sys_nice+p` to the Sunshine binary themselves. Without the
+capability PyroWave still works, but encodes compete with game GPU work at medium priority.
+
 ### Package
 
 @tabs_grouped{platform|:|

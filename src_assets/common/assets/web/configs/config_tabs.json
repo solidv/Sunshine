@@ -97,10 +97,14 @@
     "nameKey": "config.category_advanced",
     "options": {
       "fec_percentage": 20,
+      "pacing_percent": 80,
+      "pyrowave_critical_fec_percentage": 20,
+      "pyrowave_pacing_percent": 0,
       "qp": 28,
       "min_threads": 2,
       "hevc_mode": 0,
       "av1_mode": 0,
+      "pyrowave_mode": 0,
       "capture": "",
       "fp16_sdr_gamma_encoded": "disabled",
       "encoder": ""

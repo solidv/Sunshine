@@ -442,6 +442,42 @@ namespace safe {
     }
 
     /**
+     * @brief Replace the first queued item matching a predicate, or append the value.
+     *
+     * Producers that send independent snapshots can use this to keep the freshest value
+     * without growing the queue or discarding items produced by others.
+     *
+     * @param value Item that replaces a match, or is appended when nothing matches.
+     * @param matches Predicate evaluated against queued items in order.
+     * @return True when the item was replaced or appended, false when the queue is stopped
+     *         or full with no match.
+     */
+    template<class Predicate>
+    bool raise_latest(T value, Predicate matches) {
+      std::lock_guard ul {_lock};
+
+      if (!_continue) {
+        return false;
+      }
+
+      for (auto &pending : _queue) {
+        if (matches(pending)) {
+          pending = std::move(value);
+          _cv.notify_all();
+          return true;
+        }
+      }
+
+      if (_queue.size() >= _max_elements) {
+        return false;
+      }
+
+      _queue.emplace_back(std::move(value));
+      _cv.notify_all();
+      return true;
+    }
+
+    /**
      * @brief Inspect the next queued value without popping it.
      *
      * @return True when a value is available to inspect.

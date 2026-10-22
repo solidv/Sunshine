@@ -739,6 +739,7 @@ namespace config {
 
     0,  // hevc_mode
     0,  // av1_mode
+    0,  // pyrowave_mode
 
     2,  // min_threads
     {
@@ -841,9 +842,20 @@ namespace config {
 
     20,  // fecPercentage
 
+    // Protect the PyroWave frame head, which a client needs to decode anything, at 20% parity.
+    // The head is roughly 20% of the frame, so the effective overhead is about 4%. This matches
+    // the reference PyroWave host.
+    20,  // pyrowave_critical_fec_percentage
+
+    80,  // pacing_percent
+
     ENCRYPTION_MODE_NEVER,  // lan_encryption_mode
     ENCRYPTION_MODE_OPPORTUNISTIC,  // wan_encryption_mode
     0,  // packetsize
+
+    // PyroWave sends large intra frames and targets dedicated high-bandwidth links, where pacing
+    // only delays the tail of each frame. It is unpaced unless explicitly configured.
+    0,  // pyrowave_pacing_percent
   };
 
   /**
@@ -1629,6 +1641,7 @@ namespace config {
     int_f(vars, "qp", video.qp);
     int_between_f(vars, "hevc_mode", video.hevc_mode, {0, 3});
     int_between_f(vars, "av1_mode", video.av1_mode, {0, 3});
+    int_between_f(vars, "pyrowave_mode", video.pyrowave_mode, {0, 2});
     int_f(vars, "min_threads", video.min_threads);
     string_f(vars, "sw_preset", video.sw.sw_preset);
     if (!video.sw.sw_preset.empty()) {
@@ -1826,6 +1839,12 @@ namespace config {
 #endif
 
     int_between_f(vars, "fec_percentage", stream.fec_percentage, {0, 100});
+
+    int_between_f(vars, "pyrowave_critical_fec_percentage", stream.pyrowave_critical_fec_percentage, {0, 100});
+
+    int_between_f(vars, "pacing_percent", stream.pacing_percent, {0, 100});
+
+    int_between_f(vars, "pyrowave_pacing_percent", stream.pyrowave_pacing_percent, {0, 100});
 
     map_int_int_f(vars, "keybindings"s, input.keybindings);
 

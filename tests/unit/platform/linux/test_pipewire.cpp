@@ -245,6 +245,23 @@ TEST_F(PipeWireDisplayTest, DisplayDestroyedBeforeInitKeepsStandardInput) {
   }
 }
 
+TEST_F(PipeWireDisplayTest, FreshImageMatchesCurrentGeneration) {
+  auto display = std::make_shared<test_display_t>();
+
+  // Before a stream is configured there is no shared negotiation state, so capture cannot promise
+  // DMA-BUF images.
+  EXPECT_FALSE(display->can_provide_dmabuf_capture());
+
+  auto img = display->alloc_img();
+  ASSERT_NE(img, nullptr);
+
+  // A newly allocated image belongs to the current (empty) producer generation.
+  EXPECT_TRUE(display->is_capture_image_current(*img));
+
+  // There is no current PipeWire buffer to refresh from, so the refresh must fail cleanly.
+  EXPECT_FALSE(display->refresh_capture_image(*img));
+}
+
 TEST_F(PipeWireDisplayTest, TeardownDoesNotCloseFdThatPipeWireClosed) {
   if (!can_create_pipewire_context()) {
     GTEST_SKIP() << "PipeWire cannot create a client context; client.conf is probably not installed";

@@ -21,6 +21,27 @@ const config = ref(props.config)
       <div class="form-text">{{ $t('config.fec_percentage_desc') }}</div>
     </div>
 
+    <!-- Pacing Percentage -->
+    <div class="mb-3">
+      <label for="pacing_percent" class="form-label">{{ $t('config.pacing_percent') }}</label>
+      <input type="text" class="form-control" id="pacing_percent" placeholder="80" v-model="config.pacing_percent" />
+      <div class="form-text">{{ $t('config.pacing_percent_desc') }}</div>
+    </div>
+
+    <!-- PyroWave Critical FEC Percentage -->
+    <div class="mb-3">
+      <label for="pyrowave_critical_fec_percentage" class="form-label">{{ $t('config.pyrowave_critical_fec_percentage') }}</label>
+      <input type="text" class="form-control" id="pyrowave_critical_fec_percentage" placeholder="20" v-model="config.pyrowave_critical_fec_percentage" />
+      <div class="form-text">{{ $t('config.pyrowave_critical_fec_percentage_desc') }}</div>
+    </div>
+
+    <!-- PyroWave Pacing Percentage -->
+    <div class="mb-3">
+      <label for="pyrowave_pacing_percent" class="form-label">{{ $t('config.pyrowave_pacing_percent') }}</label>
+      <input type="text" class="form-control" id="pyrowave_pacing_percent" placeholder="0" v-model="config.pyrowave_pacing_percent" />
+      <div class="form-text">{{ $t('config.pyrowave_pacing_percent_desc') }}</div>
+    </div>
+
     <!-- Quantization Parameter -->
     <div class="mb-3">
       <label for="qp" class="form-label">{{ $t('config.qp') }}</label>
@@ -57,6 +78,16 @@ const config = ref(props.config)
         <option value="3">{{ $t('config.av1_mode_3') }}</option>
       </select>
       <div class="form-text">{{ $t('config.av1_mode_desc') }}</div>
+    </div>
+
+    <!-- PyroWave Support -->
+    <div class="mb-3">
+      <label for="pyrowave_mode" class="form-label">{{ $t('config.pyrowave_mode') }}</label>
+      <select id="pyrowave_mode" class="form-select" v-model="config.pyrowave_mode">
+        <option value="0">{{ $t('config.pyrowave_mode_0') }}</option>
+        <option value="2">{{ $t('config.pyrowave_mode_2') }}</option>
+      </select>
+      <div class="form-text">{{ $t('config.pyrowave_mode_desc') }}</div>
     </div>
 
     <!-- Capture -->

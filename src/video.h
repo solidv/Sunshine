@@ -6,6 +6,8 @@
 
 // standard includes
 #include <chrono>
+#include <cstdint>
+#include <optional>
 #include <string_view>
 
 // local includes
@@ -25,6 +27,26 @@ namespace stream {
   struct session_t;
 }
 
+/**
+ * @brief PyroWave codec-mode bits reported in the GameStream `ServerCodecModeSupport` field.
+ *
+ * PyroWave is a Sunshine/Moonlight protocol extension, so these bits are not part of upstream
+ * moonlight-common-c yet. The values match the client-side implementation and the guards keep
+ * them harmless once the submodule provides the definitions itself.
+ */
+#ifndef SCM_PYROWAVE
+  #define SCM_PYROWAVE 0x00800000  ///< PyroWave 4:2:0 8-bit.
+#endif
+#ifndef SCM_PYROWAVE_444
+  #define SCM_PYROWAVE_444 0x01000000  ///< PyroWave 4:4:4 8-bit.
+#endif
+#ifndef SCM_PYROWAVE10_420
+  #define SCM_PYROWAVE10_420 0x02000000  ///< PyroWave 4:2:0 10-bit.
+#endif
+#ifndef SCM_PYROWAVE10_444
+  #define SCM_PYROWAVE10_444 0x04000000  ///< PyroWave 4:4:4 10-bit.
+#endif
+
 namespace video {
 
   /**
@@ -39,11 +61,22 @@ namespace video {
     int slicesPerFrame;  ///< Number of slices per frame.
     int numRefFrames;  ///< Maximum number of reference frames.
     int encoderCscMode;  ///< Requested color range and SDR colorspace; HDR always uses BT.2020 and ST2084.
-    int videoFormat;  ///< Video codec format: 0 = H.264, 1 = HEVC, 2 = AV1.
+    int videoFormat;  ///< Video codec format: 0 = H.264, 1 = HEVC, 2 = AV1, 3 = PyroWave.
     int dynamicRange;  ///< Encoding color depth: 0 = 8-bit, 1 = 10-bit.
     int chromaSamplingType;  ///< Chroma sampling type: 0 = 4:2:0, 1 = 4:4:4.
     int enableIntraRefresh;  ///< Intra refresh setting: 0 = disabled, 1 = enabled.
+    bool pyrowaveAdaptiveFec = false;  ///< True when the client sent `x-ss-video[0].pyrowaveAdaptiveFec`; selects record framing (the value is not used for loss adaptation).
+    std::optional<std::uint32_t> pyrowaveFeatures = std::nullopt;  ///< `x-ss-video[0].pyrowaveFeatures` bitmask, when the client sent one.
+    int packetSize = 0;  ///< Negotiated maximum packet payload in bytes (`x-nv-video[0].packetSize`); 0 when unknown.
+    int pyrowaveCriticalFecPercentage = 0;  ///< Parity percentage for the PyroWave loss-critical head block.
+    int pyrowaveMinParityShards = 0;  ///< Minimum parity shards for the PyroWave critical head.
+    int pyrowaveWireOverheadBytes = 0;  ///< Per-packet bytes beyond #packetSize; 0 disables the PyroWave wire budget.
   };
+
+  /**
+   * @brief `x-nv-vqos[0].bitStreamFormat` value a client sends to request PyroWave.
+   */
+  constexpr int PYROWAVE_BITSTREAM_FORMAT = 3;
 
   namespace amf {
 
@@ -422,6 +455,10 @@ namespace video {
     }
 
     uint32_t flags;  ///< Encoder flags advertised to clients through GameStream capability responses.
+
+    /// Whether the capture backend validated for this encoder can deliver DMA-BUF images.
+    /// PyroWave consumes DMA-BUFs directly and is disabled when this is false.
+    bool capture_dmabuf = true;
   };
 
   /**
@@ -537,6 +574,28 @@ namespace video {
     stream::session_t *channel_data = nullptr;  ///< Stream session that receives this packet.
     bool after_ref_frame_invalidation = false;  ///< Whether the frame follows reference-frame invalidation.
     std::optional<std::chrono::steady_clock::time_point> frame_timestamp;  ///< Capture timestamp associated with the frame.
+
+    /**
+     * @brief Byte offset where the payload's loss-critical head ends, or 0 for none.
+     *
+     * Only produced by codecs whose bitstream is ordered most-important-first (PyroWave, which
+     * emits coarse wavelet levels before fine ones). The RTP layer cuts the frame's FEC blocks at
+     * this boundary and protects only `[0, fec_head_bytes)` with Reed-Solomon parity — loss in the
+     * head is catastrophic, while the bare tail degrades to blur that the client's partial-frame
+     * delivery can still show. 0 (every other codec, or a frame too small to split) keeps the
+     * normal even split at the configured FEC percentage.
+     */
+    size_t fec_head_bytes = 0;
+
+    /**
+     * @brief True when the payload uses PyroWave record framing.
+     *
+     * Record-framed payloads start with a PyroWave sequence header and contain reordered block and
+     * padding records instead of the length-prefixed packet list. The RTP layer then marks shards
+     * that begin with a record and reports the critical shard count to the client, which needs both
+     * for partial-frame recovery.
+     */
+    bool pyrowave_record_framing = false;
   };
 
   /**
@@ -686,6 +745,7 @@ namespace video {
 
   extern int active_hevc_mode;
   extern int active_av1_mode;
+  extern int active_pyrowave_mode;
   extern bool last_encoder_probe_supported_ref_frames_invalidation;
   extern std::array<bool, 3> last_encoder_probe_supported_yuv444_for_codec;  // 0 - H.264, 1 - HEVC, 2 - AV1
   extern std::array<bool, 3> last_encoder_probe_supported_dynamic_range_for_codec;  // 0 - H.264, 1 - HEVC, 2 - AV1

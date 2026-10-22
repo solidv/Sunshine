@@ -3,7 +3,9 @@
  * @brief Shared classes for pipewire-based capture methods.
  */
 // standard includes
+#include <algorithm>
 #include <fstream>
+#include <mutex>
 
 // lib includes
 #include <gio/gio.h>
@@ -23,6 +25,10 @@
 #include "vaapi.h"
 #include "vulkan_encode.h"
 #include "wayland.h"
+
+#ifdef SUNSHINE_ENABLE_PYROWAVE
+  #include "pyrowave_encode.h"
+#endif
 
 #if !PW_CHECK_VERSION(1, 6, 0)
 constexpr int SPA_VIDEO_TRANSFER_SMPTE2084 = 14;  ///< Protocol or platform constant for spa video transfer smpte2084.
@@ -46,7 +52,9 @@ constexpr bool SUNSHINE_USE_PIPEWIRE_OBJECT_SERIAL = false;  ///< Whether PipeWi
 
 namespace {
   // Buffer and limit constants
-  constexpr int SPA_POD_BUFFER_SIZE = 4096;
+  // Seven formats with up to 200 modifiers each exceed a 4 KiB pod builder. An exhausted
+  // builder yields null parameters, which pw_stream_connect() cannot accept.
+  constexpr int SPA_POD_BUFFER_SIZE = 32768;
   constexpr int MAX_PARAMS = 200;
   constexpr int MAX_DMABUF_FORMATS = 200;
   constexpr int MAX_DMABUF_MODIFIERS = 200;
@@ -82,6 +90,7 @@ namespace pipewire {
     std::atomic<int> color_primaries {0};  ///< PipeWire color-primaries metadata for the stream.
     std::atomic<int> transfer_function {0};  ///< PipeWire transfer-function metadata for the stream.
     std::atomic<bool> stream_dead {false};  ///< Whether the PipeWire stream has been destroyed.
+    std::atomic<bool> negotiated_dmabuf {false};  ///< Whether the stream was configured with DMA-BUF buffers.
     pw_stream_state previous_state;  ///< Previous PipeWire stream state reported by callbacks.
     pw_stream_state current_state;  ///< Current PipeWire stream state reported by callbacks.
     std::string err_msg;  ///< Last PipeWire error message reported by the stream.
@@ -101,6 +110,7 @@ namespace pipewire {
     std::condition_variable frame_cv;  ///< Signals arrival or release of a PipeWire frame.
     size_t local_stride = 0;  ///< Local stride.
     bool frame_ready = false;  ///< Whether a PipeWire frame is ready to consume.
+    std::atomic<uint64_t> frame_generation {0};  ///< Incremented whenever the producer's frame changes.
     // Two distinct memory pools
     std::vector<uint8_t> buffer_a;  ///< First staging buffer used for CPU-copy PipeWire frames.
     std::vector<uint8_t> buffer_b;  ///< Second staging buffer used for CPU-copy PipeWire frames.
@@ -139,6 +149,7 @@ namespace pipewire {
     }
 
     bool data_owned = false;  ///< Whether img->data is owned by this image and must be freed.
+    uint64_t frame_generation = 0;  ///< PipeWire frame generation the descriptor was filled from.
   };
 
   /**
@@ -217,6 +228,15 @@ namespace pipewire {
      */
     bool is_frame_ready() const {
       return stream_data.frame_ready;
+    }
+
+    /**
+     * @brief Return the generation of the most recently produced PipeWire frame.
+     *
+     * @return Monotonic counter incremented whenever the producer supplies a new frame.
+     */
+    uint64_t generation() const {
+      return stream_data.frame_generation.load();
     }
 
     /**
@@ -316,9 +336,11 @@ namespace pipewire {
      * @param dmabuf_infos Dmabuf infos.
      * @param n_dmabuf_infos N dmabuf infos.
      * @param display_is_nvidia Display is nvidia.
+     * @param pyrowave_capture Whether the stream is being captured for PyroWave, in which case only
+     *                         formats PyroWave can import are advertised.
      * @return 0 when the PipeWire stream is configured; nonzero on negotiation failure.
      */
-    int ensure_stream(const platf::mem_type_e mem_type, const uint32_t width, const uint32_t height, const AVRational target_framerate, const struct dmabuf_format_info_t *dmabuf_infos, const int n_dmabuf_infos, const bool display_is_nvidia) {
+    int ensure_stream(const platf::mem_type_e mem_type, const uint32_t width, const uint32_t height, const AVRational target_framerate, const struct dmabuf_format_info_t *dmabuf_infos, const int n_dmabuf_infos, const bool display_is_nvidia, const bool pyrowave_capture) {
       pw_thread_loop_lock(loop);
       int result = 0;
       if (!stream_data.stream) {
@@ -332,12 +354,20 @@ namespace pipewire {
 
         BOOST_LOG(debug) << "[pipewire] Create PW stream"sv;
         stream_data.stream = pw_stream_new(core, "Sunshine Video Capture", props);
+        if (!stream_data.stream) {
+          BOOST_LOG(error) << "[pipewire] Failed to create PW stream. Cannot ensure stream."sv;
+          pw_thread_loop_unlock(loop);
+          return -1;
+        }
         pw_stream_add_listener(stream_data.stream, &stream_data.stream_listener, &stream_events, &stream_data);
 
         std::array<uint8_t, SPA_POD_BUFFER_SIZE> buffer;
         struct spa_pod_builder pod_builder = SPA_POD_BUILDER_INIT(buffer.data(), buffer.size());
 
         int n_params = 0;
+        // The DMA-BUF entries are drawn from the format map (see query_dmabuf_formats) and the
+        // whole map is added again as memory-buffer fallbacks, so both fit the parameter array.
+        static_assert(format_map.size() * 2 <= (size_t) MAX_PARAMS);
         std::array<const struct spa_pod *, MAX_PARAMS> params;
 
         // Add preferred parameters for DMA-BUF with modifiers
@@ -357,9 +387,28 @@ namespace pipewire {
 
         // Add fallback for memptr
         for (const auto &fmt : format_map) {
+#ifdef SUNSHINE_ENABLE_PYROWAVE
+          // PyroWave cannot consume a CPU-mapped fallback; keep offering formats it can import so
+          // the compositor does not choose an alpha-packed 10-bit format we would then reject.
+          if (pyrowave_capture && !platf::pyrowave::supports_capture_fourcc(fmt.fourcc)) {
+            continue;
+          }
+#endif
           auto format_param = build_format_parameter(&pod_builder, width, height, target_framerate, fmt.pw_format, nullptr, 0);
           params[n_params] = format_param;
           n_params++;
+        }
+
+        // A pod builder that runs out of space yields null parameters, and
+        // pw_stream_connect() cannot handle a null entry in the parameter list.
+        if (n_params == 0 || std::any_of(params.begin(), params.begin() + n_params, [](const struct spa_pod *param) {
+              return param == nullptr;
+            })) {
+          BOOST_LOG(error) << "[pipewire] PW stream parameters incomplete. Cannot ensure stream."sv;
+          pw_stream_destroy(stream_data.stream);
+          stream_data.stream = nullptr;
+          pw_thread_loop_unlock(loop);
+          return -1;
         }
 
         // Connection via pipewire object serial if it is supported and the serial is valid (lower 32-bits != SPA_ID_INVALID, see also PW_KEY_OBJECT_SERIAL docs)
@@ -378,6 +427,14 @@ namespace pipewire {
         if (result < 0) {
           BOOST_LOG(debug) << "[pipewire] Connect PW stream on node: "sv << node;
           result = pw_stream_connect(stream_data.stream, PW_DIRECTION_INPUT, node, (enum pw_stream_flags)(PW_STREAM_FLAG_AUTOCONNECT | PW_STREAM_FLAG_MAP_BUFFERS), params.data(), n_params);
+        }
+
+        if (result < 0) {
+          // Later ensure_stream() calls return early while a stream exists, so a failed connect
+          // must destroy it or the session would keep a stream that never connected.
+          BOOST_LOG(error) << "[pipewire] Failed to connect PW stream. Cannot ensure stream."sv;
+          pw_stream_destroy(stream_data.stream);
+          stream_data.stream = nullptr;
         }
       }
 
@@ -675,6 +732,10 @@ namespace pipewire {
       pw_thread_loop_lock(loop);
       std::scoped_lock lock(stream_data.frame_mutex);
 
+      // The image may have been filled from a different buffer type last time. Start from a clean
+      // host-mapped state; the memory path below sets data for MemPtr frames.
+      img->data = nullptr;
+
       if (stream_data.shared && stream_data.shared->stream_dead.load()) {
         img->data = nullptr;
         close_img_fds(static_cast<egl::img_descriptor_t *>(img));
@@ -692,6 +753,7 @@ namespace pipewire {
       if (buf->datas[0].chunk->size != 0) {
         auto *img_descriptor = static_cast<img_descriptor_t *>(img);
         fill_img_metadata(img_descriptor, buf);
+        img_descriptor->frame_generation = stream_data.frame_generation.load();
         if (buf->datas[0].type == SPA_DATA_DmaBuf) {
           fill_img_dmabuf(img_descriptor, buf, stream_data);
         } else {
@@ -860,6 +922,7 @@ namespace pipewire {
           pw_stream_queue_buffer(d->stream, d->current_buffer);
         }
         d->current_buffer = b;
+        d->frame_generation.fetch_add(1);
         d->frame_ready = true;
       }
       // 3. Optimized Path: Software/MemPtr
@@ -878,6 +941,7 @@ namespace pipewire {
           std::swap(d->front_buffer, d->back_buffer);
 
           d->local_stride = b->buffer->datas[0].chunk->stride;
+          d->frame_generation.fetch_add(1);
           d->frame_ready = true;
           d->current_buffer = b;
         }
@@ -954,6 +1018,9 @@ namespace pipewire {
       } else {
         BOOST_LOG(info) << "[pipewire] using memory buffers"sv;
         buffer_types |= 1 << SPA_DATA_MemPtr;
+      }
+      if (d->shared) {
+        d->shared->negotiated_dmabuf.store((buffer_types & (1 << SPA_DATA_DmaBuf)) != 0);
       }
 
       // Ack the buffer type and metadata
@@ -1087,8 +1154,14 @@ namespace pipewire {
       }
       this->target_framerate = fps;
       mem_type = hwdevice_type;
+      pyrowave_capture = (config.videoFormat == ::video::PYROWAVE_BITSTREAM_FORMAT);
+      has_importable_dmabuf_format = false;
 
       if (get_dmabuf_modifiers() < 0) {
+        return -1;
+      }
+      if (pyrowave_capture && n_dmabuf_infos == 0) {
+        BOOST_LOG(error) << "[pipewire] PyroWave requires DMA-BUF capture, but no importable DMA-BUF format is available for this display"sv;
         return -1;
       }
 
@@ -1116,6 +1189,7 @@ namespace pipewire {
         shared_state->negotiated_height.store(0);
         shared_state->color_primaries.store(0);
         shared_state->transfer_function.store(0);
+        shared_state->negotiated_dmabuf.store(false);
       }
 
       if (pipewire.init(pipewire_fd, pipewire_node, pipewire_object_serial, shared_state) < 0) {
@@ -1124,7 +1198,7 @@ namespace pipewire {
       }
 
       // Start PipeWire now so format negotiation can proceed before capture start
-      if (pipewire.ensure_stream(mem_type, width, height, target_framerate, dmabuf_infos.data(), n_dmabuf_infos, display_is_nvidia) < 0) {
+      if (pipewire.ensure_stream(mem_type, width, height, target_framerate, dmabuf_infos.data(), n_dmabuf_infos, display_is_nvidia, pyrowave_capture) < 0) {
         BOOST_LOG(error) << "[pipewire] Failed to ensure pipewire stream. pipewire_t::init() failed.";
         return -1;
       }
@@ -1156,6 +1230,11 @@ namespace pipewire {
         env_logical_height = 0;
         env_logical_width = 0;
         verify_and_update_display_parameters();
+      }
+
+      if (pyrowave_capture && negotiated_w > 0 && !shared_state->negotiated_dmabuf.load()) {
+        BOOST_LOG(error) << "[pipewire] PyroWave requires DMA-BUF capture, but the compositor negotiated memory buffers"sv;
+        return -1;
       }
 
       return 0;
@@ -1246,7 +1325,7 @@ namespace pipewire {
 
       auto next_frame = std::chrono::steady_clock::now();
 
-      if (pipewire.ensure_stream(mem_type, width, height, target_framerate, dmabuf_infos.data(), n_dmabuf_infos, display_is_nvidia) < 0) {
+      if (pipewire.ensure_stream(mem_type, width, height, target_framerate, dmabuf_infos.data(), n_dmabuf_infos, display_is_nvidia, pyrowave_capture) < 0) {
         BOOST_LOG(error) << "[pipewire] Failed to ensure pipewire stream. capture() failed with error.";
         return capture_error;
       }
@@ -1366,6 +1445,65 @@ namespace pipewire {
     }
 
     /**
+     * @brief Report whether negotiated PipeWire buffers are importable DMA-BUFs.
+     *
+     * Checked by the encoder probe so PyroWave is not advertised when the compositor negotiated
+     * system-memory buffers or only formats PyroWave cannot sample.
+     *
+     * @return True when DMA-BUF buffers were negotiated and an importable format was offered.
+     */
+    bool can_provide_dmabuf_capture() const override {
+      if (!shared_state) {
+        return false;
+      }
+#ifdef SUNSHINE_ENABLE_PYROWAVE
+      if (!has_importable_dmabuf_format) {
+        return false;
+      }
+#endif
+      return shared_state->negotiated_dmabuf.load();
+    }
+
+    /**
+     * @brief Report whether a captured image still refers to the current PipeWire frame.
+     *
+     * @param img Image returned by capture().
+     * @return True when the producer has not supplied a newer frame since the image was filled.
+     */
+    bool is_capture_image_current(const platf::img_t &img) const override {
+      const auto *desc = dynamic_cast<const img_descriptor_t *>(&img);
+      if (!desc) {
+        return true;
+      }
+      return desc->frame_generation == pipewire.generation();
+    }
+
+    /**
+     * @brief Re-fill an image from PipeWire's currently held buffer.
+     *
+     * Used when the last encoded image's buffer had already been returned to the producer. The
+     * capture side still holds the newest buffer, so copying its descriptors keeps minimum-FPS
+     * duplicate encoding safe instead of sampling memory the producer may be rewriting.
+     *
+     * @param img Image to repopulate.
+     * @return True when a current DMA-BUF or mapped frame was copied into the image.
+     */
+    bool refresh_capture_image(platf::img_t &img) override {
+      auto *desc = dynamic_cast<img_descriptor_t *>(&img);
+      if (!desc) {
+        return false;
+      }
+      if (desc->data && desc->data_owned) {
+        delete[] desc->data;
+      }
+      desc->data = nullptr;
+      desc->data_owned = false;
+      desc->reset();
+      pipewire.fill_img(desc);
+      return desc->sd.fds[0] >= 0 || desc->data != nullptr;
+    }
+
+    /**
      * @brief Report whether the active display mode is HDR.
      *
      * @return True when the active display mode is HDR.
@@ -1474,6 +1612,18 @@ namespace pipewire {
         BOOST_LOG(warning) << "[pipewire] Some DMA-BUF formats are being ignored"sv;
       }
 
+#ifdef SUNSHINE_ENABLE_PYROWAVE
+      // Modifiers the PyroWave device can actually sample. The selected GPU is stable for the
+      // process, so query once; this runs for every display initialization during encoder probing.
+      static std::once_flag pyrowave_modifiers_once;
+      static std::map<uint32_t, std::vector<uint64_t>> pyrowave_modifiers;
+      if (::video::active_pyrowave_mode >= 2) {
+        std::call_once(pyrowave_modifiers_once, [] {
+          pyrowave_modifiers = platf::pyrowave::supported_capture_modifiers();
+        });
+      }
+#endif
+
       for (const auto &fmt : format_map) {
         if (n_dmabuf_infos >= MAX_DMABUF_FORMATS) {
           break;
@@ -1491,10 +1641,46 @@ namespace pipewire {
           BOOST_LOG(warning) << "[pipewire] Some DMA-BUF modifiers are being ignored"sv;
         }
 
+        const int available_modifiers = MIN(num_modifiers, MAX_DMABUF_MODIFIERS);
+        if (available_modifiers <= 0) {
+          continue;
+        }
+
+        std::vector<uint64_t> selected_modifiers;
+
+#ifdef SUNSHINE_ENABLE_PYROWAVE
+        if (::video::active_pyrowave_mode >= 2) {
+          std::vector<uint64_t> common_modifiers;
+          if (auto it = pyrowave_modifiers.find((uint32_t) fmt.fourcc); it != pyrowave_modifiers.end()) {
+            for (int i = 0; i < available_modifiers; ++i) {
+              if (std::find(it->second.begin(), it->second.end(), (uint64_t) mods[i]) != it->second.end()) {
+                common_modifiers.push_back(mods[i]);
+              }
+            }
+          }
+
+          if (common_modifiers.empty()) {
+            if (pyrowave_capture) {
+              BOOST_LOG(info) << "[pipewire] Skipping DMA-BUF format 0x" << std::hex << fmt.fourcc << std::dec
+                              << " because PyroWave cannot sample any of its modifiers"sv;
+              continue;
+            }
+          } else {
+            has_importable_dmabuf_format = true;
+            if (pyrowave_capture) {
+              selected_modifiers = std::move(common_modifiers);
+            }
+          }
+        }
+#endif
+
+        const uint64_t *modifier_values = selected_modifiers.empty() ? mods.data() : selected_modifiers.data();
+        const int modifier_count = selected_modifiers.empty() ? available_modifiers : (int) selected_modifiers.size();
+
         dmabuf_infos[n_dmabuf_infos].format = fmt.pw_format;
-        dmabuf_infos[n_dmabuf_infos].n_modifiers = MIN(num_modifiers, MAX_DMABUF_MODIFIERS);
+        dmabuf_infos[n_dmabuf_infos].n_modifiers = modifier_count;
         dmabuf_infos[n_dmabuf_infos].modifiers =
-          static_cast<uint64_t *>(g_memdup2(mods.data(), sizeof(uint64_t) * dmabuf_infos[n_dmabuf_infos].n_modifiers));
+          static_cast<uint64_t *>(g_memdup2(modifier_values, sizeof(uint64_t) * modifier_count));
         ++n_dmabuf_infos;
       }
     }
@@ -1550,13 +1736,15 @@ namespace pipewire {
     platf::mem_type_e mem_type;
     wl::display_t wl_display;
     std::array<struct dmabuf_format_info_t, MAX_DMABUF_FORMATS> dmabuf_infos;
-    int n_dmabuf_infos;
+    int n_dmabuf_infos = 0;  ///< Number of DMA-BUF formats advertised to PipeWire.
     bool display_is_nvidia = false;  // Track if display GPU is NVIDIA
     std::chrono::nanoseconds delay;
     std::optional<std::uint64_t> last_pts {};
     std::optional<std::uint64_t> last_seq {};
     std::uint64_t sequence {};
     AVRational target_framerate;
+    bool pyrowave_capture = false;  ///< True when only PyroWave-importable formats may be offered.
+    bool has_importable_dmabuf_format = false;  ///< True when an offered DMA-BUF format has a PyroWave mapping.
 
   protected:
     // Allow subclasses to access for pipewire requirements setup and stream dead checks

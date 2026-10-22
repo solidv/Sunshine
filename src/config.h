@@ -75,6 +75,7 @@ namespace config {
 
     int hevc_mode;  ///< HEVC support mode advertised to clients.
     int av1_mode;  ///< AV1 support mode advertised to clients.
+    int pyrowave_mode;  ///< PyroWave support mode advertised to clients (0 = off, 2 = on).
 
     int min_threads;  ///< Minimum number of threads or slices for CPU encoding.
 
@@ -264,7 +265,11 @@ namespace config {
 
     std::string file_apps;  ///< Path to the configured applications file.
 
-    int fec_percentage;  ///< Percentage of forward-error-correction packets to add to the stream (0-100); 0 disables FEC.
+    int fec_percentage;  ///< Percentage of forward-error-correction packets to add to the stream (0-100); 0 disables FEC. PyroWave frames use their own head-only parity instead (see pyrowave_critical_fec_percentage and stream::fec_percent_for_codec()).
+
+    int pyrowave_critical_fec_percentage;  ///< Parity percentage for the PyroWave shards holding the coarsest wavelet level (0-100); 0 disables head protection.
+
+    int pacing_percent;  ///< Intra-frame send pacing as a percentage of 1 Gbps; 0 disables pacing.
 
     // Video encryption settings for LAN and WAN streams
     int lan_encryption_mode;  ///< Video encryption policy for LAN clients.
@@ -272,6 +277,8 @@ namespace config {
 
     // Limit the packetsize to avoid fragmentation on a low MTU link
     int packetsize;  ///< Maximum payload size for network packets.
+
+    int pyrowave_pacing_percent;  ///< Intra-frame send pacing for PyroWave sessions as a percentage of 1 Gbps; 0 disables pacing.
   };
 
   /**

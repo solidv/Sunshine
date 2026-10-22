@@ -2072,6 +2072,10 @@ consent prompt for directory ACLs, so the Web UI shows setup steps for correctin
             Set to <code>0</code> to disable forward error correction.
             @warning{Higher values can correct for more network packet loss,
             but at the cost of increasing bandwidth usage.}
+            @note{PyroWave frames protect only their loss-critical coarse wavelet bands, using
+            @code{}pyrowave_critical_fec_percentage@endcode instead of this setting, so their
+            effective FEC overhead is lower. This setting still applies to PyroWave frames that
+            cannot be split (very small or oversized frames) and to all other codecs.}
         </td>
     </tr>
     <tr>
@@ -2088,6 +2092,102 @@ consent prompt for directory ACLs, so the Web UI shows setup steps for correctin
         <td>Example</td>
         <td colspan="2">@code{}
             fec_percentage = 20
+            @endcode</td>
+    </tr>
+</table>
+
+### pacing_percent
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Intra-frame send pacing as a percentage of 1 Gbps. Pacing spreads each frame's
+            packets over time instead of sending them as one burst. A value of 0 disables
+            pacing and sends each frame as fast as the link allows, which can reduce latency
+            on a dedicated network.
+            @note{PyroWave sessions use @code{}pyrowave_pacing_percent@endcode instead.}
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            80
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Range</td>
+        <td colspan="2">0-100</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            pacing_percent = 0
+            @endcode</td>
+    </tr>
+</table>
+
+### pyrowave_critical_fec_percentage
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Parity added to the PyroWave shards holding the sequence header and the coarsest wavelet
+            level. Losing any of those shards prevents the client from decoding the frame, while a
+            lost finer record only blurs its area. The protected head is roughly 20% of a frame, so
+            the effective bandwidth overhead is about a fifth of this value (4% at the default).
+            The protected block always receives at least two parity shards. Set to <code>0</code>
+            to send PyroWave frames without head parity.
+            @note{Applies to Linux only, together with @code{}pyrowave_mode@endcode.}
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            20
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Range</td>
+        <td colspan="2">0-100</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            pyrowave_critical_fec_percentage = 50
+            @endcode</td>
+    </tr>
+</table>
+
+### pyrowave_pacing_percent
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Intra-frame send pacing for PyroWave sessions as a percentage of 1 Gbps. PyroWave sends
+            large intra-only frames, so pacing delays the last packets of every frame and adds that
+            delay to its latency. A value of 0 (default) sends each frame as fast as the link allows,
+            matching the reference PyroWave implementation. Raise it only if the stream overwhelms a
+            slower or congested link.
+            @note{Applies to Linux only, together with @code{}pyrowave_mode@endcode.}
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            0
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Range</td>
+        <td colspan="2">0-100</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            pyrowave_pacing_percent = 80
             @endcode</td>
     </tr>
 </table>
@@ -2223,6 +2323,42 @@ consent prompt for directory ACLs, so the Web UI shows setup steps for correctin
     <tr>
         <td>3</td>
         <td>advertise support for AV1 Main 8-bit and 10-bit (HDR) profiles</td>
+    </tr>
+</table>
+
+### pyrowave_mode
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Allows the client to request PyroWave, a GPU wavelet (intra-only) video codec for
+            low-latency local streaming.
+            @note{Requires a PyroWave-enabled build, a Vulkan 1.3+ GPU (Vulkan 1.4 features are
+            used when available), and a DMA-BUF capture path
+            (set @code{}encoder = vulkan@endcode). Applies to Linux only.}
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            0
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            pyrowave_mode = 2
+            @endcode</td>
+    </tr>
+    <tr>
+        <td rowspan="2">Choices</td>
+        <td>0</td>
+        <td>do not advertise support for PyroWave</td>
+    </tr>
+    <tr>
+        <td>2</td>
+        <td>advertise support for PyroWave</td>
     </tr>
 </table>
 

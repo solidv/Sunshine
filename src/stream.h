@@ -41,6 +41,35 @@ namespace stream {
     std::optional<int> gcmap;  ///< Optional game-controller mapping override from the launch request.
   };
 
+  /**
+   * @brief Select the intra-frame pacing percentage to use for a session's codec.
+   *
+   * PyroWave sends large intra-only frames over high-bandwidth links, where spreading a frame
+   * over time only delays its last packets, so it has its own pacing setting that defaults to 0
+   * (unpaced). Every other codec uses the generic pacing percentage.
+   *
+   * @param is_pyrowave True when the session negotiated the PyroWave codec.
+   * @param pacing_percent Configured pacing percentage for non-PyroWave codecs.
+   * @param pyrowave_pacing_percent Configured pacing percentage for PyroWave sessions.
+   * @return Pacing rate as a percentage of 1 Gbps; 0 disables pacing.
+   */
+  int pacing_percent_for_codec(bool is_pyrowave, int pacing_percent, int pyrowave_pacing_percent);
+
+  /**
+   * @brief Select the effective FEC overhead percentage to account for in a session's bitrate.
+   *
+   * PyroWave frames protect only their loss-critical head (the coarsest wavelet bands) and leave
+   * the fine tail bare. The head is roughly 20% of a frame's bytes, so the effective overhead is
+   * about a fifth of the configured head parity. The generic percentage still applies to every
+   * other codec and to PyroWave frames that cannot be split (very small or oversized frames).
+   *
+   * @param is_pyrowave True when the session negotiated the PyroWave codec.
+   * @param fec_percent Configured FEC percentage for non-PyroWave codecs.
+   * @param pyrowave_critical_fec_percentage Configured parity percentage for the PyroWave head.
+   * @return FEC parity bytes as a percentage of payload bytes.
+   */
+  int fec_percent_for_codec(bool is_pyrowave, int fec_percent, int pyrowave_critical_fec_percentage);
+
   namespace session {
     /**
      * @brief Enumerates supported state options.

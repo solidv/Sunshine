@@ -412,6 +412,7 @@ namespace platf {
      * @brief Capability bit indicating controller touchpad and motion support.
      */
     constexpr caps_t controller_touch = 0x02;  // Controller touch and motion events
+
   };  // namespace platform_caps
 
   /**
@@ -748,6 +749,44 @@ namespace platf {
      * @return Capture status reported to the streaming pipeline.
      */
     virtual int dummy_img(img_t *img) = 0;
+
+    /**
+     * @brief Report whether capture can hand the encoder GPU (DMA-BUF) images.
+     *
+     * Only the PipeWire-based capture paths (KWin and the portal) currently implement this, so an
+     * encoder that consumes DMA-BUFs directly (PyroWave) is not advertised for other backends.
+     *
+     * @return True when captured images can carry DMA-BUF file descriptors.
+     */
+    virtual bool can_provide_dmabuf_capture() const {
+      return false;
+    }
+
+    /**
+     * @brief Report whether an image still describes the capture backend's current frame.
+     *
+     * Capture backends that recycle producer-owned buffers override this so callers re-encoding
+     * the most recent image do not sample a buffer that has already been returned to its producer.
+     *
+     * @param img Image previously returned by capture().
+     * @return True when the image's contents are still owned by the capture backend.
+     */
+    virtual bool is_capture_image_current(const img_t &img) const {
+      return true;
+    }
+
+    /**
+     * @brief Refresh a previously captured image from the backend's current frame.
+     *
+     * Backends that recycle producer-owned buffers override this so a caller re-encoding the last
+     * image can pick up the backend's current frame after the previous buffer was returned.
+     *
+     * @param img Image to repopulate from the current capture buffer.
+     * @return True when the image now describes a current frame; false when no frame is available.
+     */
+    virtual bool refresh_capture_image(img_t &img) {
+      return false;
+    }
 
     /**
      * @brief Create AVCodec encode device.

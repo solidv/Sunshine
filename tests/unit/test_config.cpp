@@ -259,6 +259,85 @@ TEST_F(ConfigPersistenceTest, ParsesFecPercentagesAndRejectsOutOfRangeValues) {
   }
 }
 
+TEST_F(ConfigPersistenceTest, ParsesPyrowaveCriticalFecPercentagesAndRejectsOutOfRangeValues) {
+  const auto original_stream = config::stream;
+  const auto restore_stream = util::fail_guard([original_stream]() {
+    config::stream = original_stream;
+  });
+  const auto apps_file = config_file().parent_path() / "sunshine_test_config_apps.json";
+  ASSERT_EQ(file_handler::write_file(apps_file.string().c_str(), "{}"), 0);
+  config::stream.file_apps = apps_file.string();
+
+  constexpr std::array cases {
+    std::pair {0, 0},
+    std::pair {1, 1},
+    std::pair {20, 20},
+    std::pair {99, 99},
+    std::pair {100, 100},
+    std::pair {-1, 20},
+    std::pair {101, 20},
+    std::pair {255, 20},
+  };
+  for (const auto &[setting, expected] : cases) {
+    config::stream.pyrowave_critical_fec_percentage = 20;
+    config::apply_config_for_test(std::format("pyrowave_critical_fec_percentage = {}\n", setting));
+    EXPECT_EQ(config::stream.pyrowave_critical_fec_percentage, expected) << setting;
+  }
+}
+
+TEST_F(ConfigPersistenceTest, ParsesPyrowaveModesAndPacingPercentages) {
+  const auto original_video = config::video;
+  const auto original_stream = config::stream;
+  const auto restore = util::fail_guard([original_video, original_stream]() {
+    config::video = original_video;
+    config::stream = original_stream;
+  });
+  const auto apps_file = config_file().parent_path() / "sunshine_test_config_apps.json";
+  ASSERT_EQ(file_handler::write_file(apps_file.string().c_str(), "{}"), 0);
+  config::stream.file_apps = apps_file.string();
+
+  constexpr std::array mode_cases {
+    std::pair {0, 0},
+    std::pair {1, 1},
+    std::pair {2, 2},
+    std::pair {-1, 2},
+    std::pair {3, 2},
+  };
+  for (const auto &[setting, expected] : mode_cases) {
+    config::video.pyrowave_mode = 2;
+    config::apply_config_for_test(std::format("pyrowave_mode = {}\n", setting));
+    EXPECT_EQ(config::video.pyrowave_mode, expected) << setting;
+  }
+
+  constexpr std::array pacing_cases {
+    std::pair {0, 0},
+    std::pair {1, 1},
+    std::pair {80, 80},
+    std::pair {100, 100},
+    std::pair {-1, 80},
+    std::pair {101, 80},
+  };
+  for (const auto &[setting, expected] : pacing_cases) {
+    config::stream.pacing_percent = 80;
+    config::apply_config_for_test(std::format("pacing_percent = {}\n", setting));
+    EXPECT_EQ(config::stream.pacing_percent, expected) << setting;
+  }
+
+  constexpr std::array pyrowave_pacing_cases {
+    std::pair {0, 0},
+    std::pair {1, 1},
+    std::pair {80, 80},
+    std::pair {100, 100},
+    std::pair {-1, 0},
+    std::pair {101, 0},
+  };
+  for (const auto &[setting, expected] : pyrowave_pacing_cases) {
+    config::stream.pyrowave_pacing_percent = 0;
+    config::apply_config_for_test(std::format("pyrowave_pacing_percent = {}\n", setting));
+    EXPECT_EQ(config::stream.pyrowave_pacing_percent, expected) << setting;
+  }
+}
+
 TEST_F(ConfigPersistenceTest, ParsesNvencTwoPassModesAndDefaultsUnknownValues) {
   using enum nvenc::nvenc_two_pass;
   const auto original_video = config::video;

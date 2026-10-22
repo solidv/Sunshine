@@ -27,6 +27,8 @@ extern "C" {
 #include "input.h"
 #include "logging.h"
 #include "network.h"
+#include "pyrowave_policy.h"
+#include "pyrowave_protocol.h"
 #include "rtsp.h"
 #include "stream.h"
 #include "sync.h"
@@ -909,6 +911,14 @@ namespace rtsp_stream {
       ss << "a=rtpmap:98 AV1/90000"sv << std::endl;
     }
 
+    if (video::active_pyrowave_mode >= 2) {
+      // Capability marker and the bitstream revision the client's decoder must match. PyroWave is
+      // intra-only and its bitstream carries no version field, so a mismatch is only detectable
+      // out of band. No RTP payload type 99 is ever sent.
+      ss << pyrowave::protocol::DESCRIBE_RTPMAP << std::endl;
+      ss << pyrowave::protocol::DESCRIBE_BITSTREAM_ATTRIBUTE << pyrowave::protocol::BITSTREAM_ID << std::endl;
+    }
+
     if (!session.surround_params.empty()) {
       // If we have our own surround parameters, advertise them twice first
       ss << "a=fmtp:97 surround-params="sv << session.surround_params << std::endl;
@@ -1065,8 +1075,8 @@ namespace rtsp_stream {
         auto name = line.substr(2, pos - 2);
         auto val = line.substr(pos + 1);
 
-        if (val[val.size() - 1] == ' ') {
-          val = val.substr(0, val.size() - 1);
+        if (!val.empty() && val.back() == ' ') {
+          val.remove_suffix(1);
         }
         args.try_emplace(name, val);
       }
@@ -1154,6 +1164,24 @@ namespace rtsp_stream {
       config.monitor.chromaSamplingType = (int) util::from_view(args.at("x-ss-video[0].chromaSamplingType"sv));
       config.monitor.enableIntraRefresh = (int) util::from_view(args.at("x-ss-video[0].intraRefresh"sv));
 
+      // PyroWave framing negotiation. The adaptive-FEC attribute selects record framing by its
+      // presence alone (the value is unused), while the feature mask carries explicit capabilities.
+      // Both are optional, so clients that send neither keep the length-prefixed compatibility
+      // framing. Presence must be checked before any default is inserted for these keys.
+      config.monitor.pyrowaveAdaptiveFec = args.contains(pyrowave::protocol::ANNOUNCE_ADAPTIVE_FEC);
+      if (const auto features = args.find(pyrowave::protocol::ANNOUNCE_FEATURES); features != args.end()) {
+        config.monitor.pyrowaveFeatures = static_cast<std::uint32_t>(util::from_view(features->second));
+      }
+
+      // Snapshot the PyroWave FEC policy for this session. The encoder's wire budget and the
+      // frame sender must use the same values even if the configuration changes mid-session.
+      config.monitor.pyrowaveCriticalFecPercentage = config::stream.pyrowave_critical_fec_percentage;
+      config.monitor.pyrowaveMinParityShards = std::max(2, config.minRequiredFecPackets);
+
+      // The encoder sizes its transport chunks to the negotiated packet size so one chunk fits one
+      // datagram (PyroWave only).
+      config.monitor.packetSize = config.packetsize;
+
       configuredBitrateKbps = util::from_view(args.at("x-ml-video.configuredBitrateKbps"sv));
     } catch (std::out_of_range &) {
       respond(sock, session, &option, 400, "BAD REQUEST", req->sequenceNumber, {});
@@ -1206,20 +1234,53 @@ namespace rtsp_stream {
     if (configuredBitrateKbps) {
       BOOST_LOG(debug) << "Client configured bitrate is "sv << configuredBitrateKbps << " Kbps"sv;
 
-      // If the FEC percentage isn't too high, adjust the configured bitrate to ensure video
-      // traffic doesn't exceed the user's selected bitrate when the FEC shards are included.
-      if (config::stream.fec_percentage <= 80) {
-        configuredBitrateKbps /= 100.f / (100 - config::stream.fec_percentage);
+      const auto pyrowave_framing = pyrowave::policy::select_framing(config.monitor.pyrowaveAdaptiveFec, config.monitor.pyrowaveFeatures);
+      const bool pyrowave_wire_budget = config.monitor.videoFormat == video::PYROWAVE_BITSTREAM_FORMAT &&
+                                        pyrowave_framing == pyrowave::policy::framing_e::records &&
+                                        config.packetsize > pyrowave::protocol::SHARD_OVERHEAD_BYTES;
+
+      if (pyrowave_wire_budget) {
+        // The client's configured bitrate is the total wire budget. Deduct audio (including its
+        // 50% FEC) and control traffic here; the encoder deducts packet headers and the reserved
+        // critical-block parity from the remainder.
+        configuredBitrateKbps = pyrowave::policy::video_wire_budget_kbps(
+          configuredBitrateKbps,
+          config.audio.channels,
+          config.audio.flags[audio::config_t::HIGH_QUALITY]
+        );
+        if (configuredBitrateKbps <= 0) {
+          BOOST_LOG(warning) << "PyroWave bandwidth budget cannot accommodate audio and control overhead"sv;
+          respond(sock, session, &option, 400, "BAD REQUEST", req->sequenceNumber, {});
+          return;
+        }
+
+        boost::system::error_code remote_ec;
+        const auto remote = sock.remote_endpoint(remote_ec);
+        config.monitor.pyrowaveWireOverheadBytes = static_cast<int>(pyrowave::policy::wire_packet_overhead_bytes(
+          remote_ec || remote.address().is_v6(),
+          (config.encryptionFlagsEnabled & SS_ENC_VIDEO) != 0
+        ));
+      } else {
+        // PyroWave protects only the frame's loss-critical head, so its effective overhead is lower
+        // than the generic configured percentage; using the generic value would needlessly shrink
+        // its encoding bitrate. Its own head percentage is accounted for instead.
+        const auto fec_percent = stream::fec_percent_for_codec(config.monitor.videoFormat == video::PYROWAVE_BITSTREAM_FORMAT, config::stream.fec_percentage, config::stream.pyrowave_critical_fec_percentage);
+
+        // If the effective FEC percentage isn't too high, adjust the configured bitrate to ensure
+        // video traffic doesn't exceed the user's selected bitrate when the FEC shards are included.
+        if (fec_percent <= 80) {
+          configuredBitrateKbps /= 100.f / (100 - fec_percent);
+        }
+
+        // Adjust the bitrate to account for audio traffic bandwidth usage (capped at 20% reduction).
+        // The bitrate per channel is 256 Kbps for high quality mode and 96 Kbps for normal quality.
+        auto audioBitrateAdjustment = (config.audio.flags[audio::config_t::HIGH_QUALITY] ? 256 : 96) * config.audio.channels;
+        configuredBitrateKbps -= std::min((std::int64_t) audioBitrateAdjustment, configuredBitrateKbps / 5);
+
+        // Reduce it by another 500Kbps to account for A/V packet overhead and control data
+        // traffic (capped at 10% reduction).
+        configuredBitrateKbps -= std::min((std::int64_t) 500, configuredBitrateKbps / 10);
       }
-
-      // Adjust the bitrate to account for audio traffic bandwidth usage (capped at 20% reduction).
-      // The bitrate per channel is 256 Kbps for high quality mode and 96 Kbps for normal quality.
-      auto audioBitrateAdjustment = (config.audio.flags[audio::config_t::HIGH_QUALITY] ? 256 : 96) * config.audio.channels;
-      configuredBitrateKbps -= std::min((std::int64_t) audioBitrateAdjustment, configuredBitrateKbps / 5);
-
-      // Reduce it by another 500Kbps to account for A/V packet overhead and control data
-      // traffic (capped at 10% reduction).
-      configuredBitrateKbps -= std::min((std::int64_t) 500, configuredBitrateKbps / 10);
 
       BOOST_LOG(debug) << "Final adjusted video encoding bitrate is "sv << configuredBitrateKbps << " Kbps"sv;
       config.monitor.bitrate = (int) configuredBitrateKbps;
@@ -1234,6 +1295,13 @@ namespace rtsp_stream {
 
     if (config.monitor.videoFormat == 2 && video::active_av1_mode == 1) {
       BOOST_LOG(warning) << "AV1 is disabled, yet the client requested AV1"sv;
+
+      respond(sock, session, &option, 400, "BAD REQUEST", req->sequenceNumber, {});
+      return;
+    }
+
+    if (config.monitor.videoFormat == video::PYROWAVE_BITSTREAM_FORMAT && video::active_pyrowave_mode < 2) {
+      BOOST_LOG(warning) << "PyroWave is disabled, yet the client requested PyroWave"sv;
 
       respond(sock, session, &option, 400, "BAD REQUEST", req->sequenceNumber, {});
       return;

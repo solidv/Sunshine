@@ -102,3 +102,78 @@ TEST(ThreadSafeQueue, RejectsItemsAfterStop) {
 
   EXPECT_FALSE(queue.raise(1));
 }
+
+TEST(ThreadSafeQueue, RaiseLatestReplacesMatchingItem) {
+  safe::queue_t<int> queue {2};
+
+  ASSERT_TRUE(queue.raise(1));
+  ASSERT_TRUE(queue.raise(2));
+
+  EXPECT_TRUE(queue.raise_latest(3, [](int value) {
+    return value == 1;
+  }));
+
+  const auto first = queue.pop();
+  ASSERT_TRUE(first);
+  EXPECT_EQ(*first, 3);
+
+  const auto second = queue.pop();
+  ASSERT_TRUE(second);
+  EXPECT_EQ(*second, 2);
+}
+
+TEST(ThreadSafeQueue, RaiseLatestAppendsWithoutMatch) {
+  safe::queue_t<int> queue {2};
+
+  ASSERT_TRUE(queue.raise(1));
+
+  EXPECT_TRUE(queue.raise_latest(2, [](int value) {
+    return value == 99;
+  }));
+
+  const auto first = queue.pop();
+  ASSERT_TRUE(first);
+  EXPECT_EQ(*first, 1);
+
+  const auto second = queue.pop();
+  ASSERT_TRUE(second);
+  EXPECT_EQ(*second, 2);
+}
+
+TEST(ThreadSafeQueue, RaiseLatestReplacesWhenAtCapacity) {
+  safe::queue_t<int> queue {1, safe::queue_t<int>::overflow_policy_e::reject};
+
+  ASSERT_TRUE(queue.raise(1));
+
+  EXPECT_TRUE(queue.raise_latest(2, [](int value) {
+    return value == 1;
+  }));
+
+  const auto value = queue.pop();
+  ASSERT_TRUE(value);
+  EXPECT_EQ(*value, 2);
+}
+
+TEST(ThreadSafeQueue, RaiseLatestRefusesWhenFullWithoutMatch) {
+  safe::queue_t<int> queue {1, safe::queue_t<int>::overflow_policy_e::reject};
+
+  ASSERT_TRUE(queue.raise(1));
+
+  EXPECT_FALSE(queue.raise_latest(2, [](int value) {
+    return value == 99;
+  }));
+
+  const auto value = queue.pop();
+  ASSERT_TRUE(value);
+  EXPECT_EQ(*value, 1);
+}
+
+TEST(ThreadSafeQueue, RaiseLatestRejectsItemsAfterStop) {
+  safe::queue_t<int> queue;
+
+  queue.stop();
+
+  EXPECT_FALSE(queue.raise_latest(1, [](int) {
+    return true;
+  }));
+}
