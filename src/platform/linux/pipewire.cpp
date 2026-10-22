@@ -545,11 +545,16 @@ namespace pipewire {
     /**
      * @brief Determine if Pipewire's pts metadata is suitable for client pacing based on compositor type/version whitelist.
      *
+     * Compositor pts is only usable when the compositor delivers frames on its own fixed grid. With
+     * variable rate capture Sunshine paces the stream and stamps the duplicate frames it inserts
+     * itself, so all frames must use Sunshine's clock instead.
+     *
      * @param compositor Struct containing compositor type and version.
      * @param selected_display_name Name of display - specifically the connector type - such as DP-1, HDMI-1, etc.
+     * @param variable_rate Whether variable rate capture was negotiated, in which case Sunshine paces the stream.
      * @return True if pts metadata is suitable.
      */
-    static bool use_pipewire_pts(const compositor_version_t &compositor, const std::string &selected_display_name) {
+    static bool use_pipewire_pts(const compositor_version_t &compositor, const std::string &selected_display_name, bool variable_rate) {
       // KWin: use Pipewire pts metadata for versions 6.7.80+ (6.8 beta) or newer.
       // Mutter: use Pipewire pts metadata for Mutter 51 onwards, but pts is reliable only for virtual monitors (Meta-).
       // All other cases: don't use Pipewire pts metadata directly.
@@ -570,6 +575,12 @@ namespace pipewire {
           break;
       }
 
+      if (variable_rate) {
+        // Sunshine performs the pacing and timestamps duplicates from its rate control, so letting
+        // compositor pts through would mix two clocks in the frame timestamps.
+        use_pts = false;
+      }
+
       BOOST_LOG(info) << "[pipewire] Using frame_timestamp (pts) metadata source: "sv
                       << (use_pts ? "Pipewire (via compositor)" : PROJECT_NAME);
       return use_pts;
@@ -583,20 +594,21 @@ namespace pipewire {
      */
     static bool
       use_variable_rate(const compositor_version_t &compositor) {
-      // If the active compositor is KWin, request variable rate (0, 1) capture for versions 5.x-6.7.79 (up to 6.7 stable series).
+      // If the active compositor is KWin, request variable rate (0, 1) capture for versions 5.x up to and including the 6.8 series.
       // Issue: KWin <=6.7 has a ~3% fixed-rate pacing deficit vs the requested framerate; variable rate avoids this and prioritizes gaming smoothness.
       //        KWin 6.7 regresses variable rate (desktop animations run at half speed, but doesn't affect in-game pacing). Ref: https://bugs.kde.org/show_bug.cgi?id=524129
-      // Issue: KWin 6.8 still has desktop animation pacing issues with variable rate, but fixes the 3% fixed-rate pacing deficit. Fixed-rate pacing has
-      //        new regression tied to 'commit-timing'/VK_KHR_present_timing support when Vsync/FIFO is enabled. Ref: https://bugs.kde.org/show_bug.cgi?id=525619
-      // Summary: KWin 5.5-6.6 have excellent (variable) pacing. KWin 6.7 has poor desktop animation pacing (variable) but good game pacing.
-      //          KWin 6.8+ will have good overall (fixed) pacing if #525619 can be resolved, otherwise we will update docs advising to disable VSync in games.
+      // Issue: KWin 6.8 was expected to fix fixed-rate pacing, but its screencast delivers frames from a synthetic vsync grid
+      //        (SoftwareVsyncMonitor) instead of following content, which still stutters with fixed rate, even with
+      //        https://invent.kde.org/plasma/kwin/-/merge_requests/9082 cherry-picked. Ref: https://bugs.kde.org/show_bug.cgi?id=525619
+      // Summary: KWin 5.5-6.8 have good in-game pacing when Sunshine performs the pacing (variable rate), so request variable rate for the 6.8 series
+      //          as well. Variable rate retains the desktop animation pacing issue, which does not affect in-game pacing.
 
       // All other compositors (including Mutter) will default to variable rate.
       bool variable_rate = true;
 
       using enum compositor_type_e;
       if (compositor.type == kwin) {
-        variable_rate = (compositor.version[0] == 5 || (compositor.version[0] == 6 && (compositor.version[1] < 7 || (compositor.version[1] == 7 && compositor.version[2] < 80))));
+        variable_rate = (compositor.version[0] == 5 || (compositor.version[0] == 6 && compositor.version[1] < 9));
       }
 
       return variable_rate;
@@ -1094,7 +1106,7 @@ namespace pipewire {
       verify_and_update_display_parameters();
 
       // Determine if pts metadata should be sourced from Pipewire or sampled by Sunshine at time of capture.
-      pipewire.prefer_pipewire_pts = pipewire.use_pipewire_pts(compositor, display_name);
+      pipewire.prefer_pipewire_pts = pipewire.use_pipewire_pts(compositor, display_name, pipewire.negotiate_variable_rate);
 
       if (!shared_state) {
         shared_state = std::make_shared<shared_state_t>();

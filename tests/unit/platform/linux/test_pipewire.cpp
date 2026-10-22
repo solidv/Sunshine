@@ -1,6 +1,10 @@
 /**
  * @file tests/unit/platform/linux/test_pipewire.cpp
- * @brief Test the teardown of the shared PipeWire capture display.
+ * @brief Test the PipeWire capture pacing gates and the teardown of the shared capture display.
+ *
+ * The pacing gates are members of pipewire_t, which is defined inside pipewire.cpp. The source is
+ * included directly, as kwingrab.cpp and portalgrab.cpp do, so that this test exercises the copy
+ * of the decisions that is private to its own translation unit.
  */
 #if defined(SUNSHINE_BUILD_KWIN) || defined(SUNSHINE_BUILD_PORTAL)
   // test includes
@@ -14,10 +18,12 @@
   #include <filesystem>
   #include <fstream>
   #include <future>
+  #include <initializer_list>
   #include <memory>
   #include <optional>
   #include <string>
   #include <thread>
+  #include <vector>
 
   // lib includes
   #include <fcntl.h>
@@ -283,4 +289,57 @@ TEST_F(PipeWireDisplayTest, TeardownAfterFailedConnectionClosesStreamFd) {
   // pw_context_connect_fd() fails and does not take the stream fd over.
   expect_failed_init_closes_stream_fd("context.properties = { }\ncontext.modules = [ ]\n");
 }
+
+namespace pipewire {
+  namespace {
+    /**
+     * @brief Build a compositor version for a gate check.
+     *
+     * @param type Compositor type.
+     * @param version Compositor version.
+     * @return Compositor version struct.
+     */
+    pipewire_t::compositor_version_t make_compositor(pipewire_t::compositor_type_e type, std::initializer_list<int> version) {
+      return {type, std::vector<int>(version)};
+    }
+  }  // namespace
+
+  TEST(PipewireVariableRateGate, SelectsVariableRateForKWinSixEightAndOlder) {
+    using enum pipewire_t::compositor_type_e;
+    EXPECT_TRUE(pipewire_t::use_variable_rate(make_compositor(kwin, {5, 27, 90})));
+    EXPECT_TRUE(pipewire_t::use_variable_rate(make_compositor(kwin, {6, 6, 5})));
+    EXPECT_TRUE(pipewire_t::use_variable_rate(make_compositor(kwin, {6, 7, 79})));
+    EXPECT_TRUE(pipewire_t::use_variable_rate(make_compositor(kwin, {6, 7, 80})));
+    EXPECT_TRUE(pipewire_t::use_variable_rate(make_compositor(kwin, {6, 8, 0})));
+    EXPECT_TRUE(pipewire_t::use_variable_rate(make_compositor(kwin, {6, 8, 5})));
+    EXPECT_FALSE(pipewire_t::use_variable_rate(make_compositor(kwin, {6, 9, 0})));
+    EXPECT_FALSE(pipewire_t::use_variable_rate(make_compositor(kwin, {7, 0, 0})));
+
+    // Compositors without a known pacing regression keep variable rate capture.
+    EXPECT_TRUE(pipewire_t::use_variable_rate(make_compositor(gnome, {47, 0, 0})));
+    EXPECT_TRUE(pipewire_t::use_variable_rate(pipewire_t::compositor_version_t {}));
+  }
+
+  TEST(PipewirePtsSourceGate, SelectsCompositorPtsOnlyForFixedRateSessions) {
+    using enum pipewire_t::compositor_type_e;
+
+    EXPECT_FALSE(pipewire_t::use_pipewire_pts(make_compositor(kwin, {6, 7, 79}), "DP-1", false));
+    EXPECT_TRUE(pipewire_t::use_pipewire_pts(make_compositor(kwin, {6, 7, 80}), "DP-1", false));
+    EXPECT_TRUE(pipewire_t::use_pipewire_pts(make_compositor(kwin, {6, 8, 0}), "HDMI-A-1", false));
+    EXPECT_TRUE(pipewire_t::use_pipewire_pts(make_compositor(kwin, {7, 0, 0}), "DP-1", false));
+
+    // Mutter only provides reliable pts for virtual monitors, from version 51 onwards.
+    EXPECT_FALSE(pipewire_t::use_pipewire_pts(make_compositor(gnome, {50, 0, 0}), "Meta-1", false));
+    EXPECT_FALSE(pipewire_t::use_pipewire_pts(make_compositor(gnome, {51, 0, 0}), "DP-1", false));
+    EXPECT_TRUE(pipewire_t::use_pipewire_pts(make_compositor(gnome, {51, 0, 0}), "Meta-1", false));
+
+    EXPECT_FALSE(pipewire_t::use_pipewire_pts(pipewire_t::compositor_version_t {}, "DP-1", false));
+
+    // Sunshine paces the stream in variable rate mode and timestamps its duplicate frames itself,
+    // so frames must not mix compositor pts with Sunshine's rate control timestamps.
+    EXPECT_FALSE(pipewire_t::use_pipewire_pts(make_compositor(kwin, {6, 8, 0}), "HDMI-A-1", true));
+    EXPECT_FALSE(pipewire_t::use_pipewire_pts(make_compositor(kwin, {7, 0, 0}), "DP-1", true));
+    EXPECT_FALSE(pipewire_t::use_pipewire_pts(make_compositor(gnome, {51, 0, 0}), "Meta-1", true));
+  }
+}  // namespace pipewire
 #endif
