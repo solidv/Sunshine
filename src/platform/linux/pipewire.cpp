@@ -819,10 +819,6 @@ namespace pipewire {
         spa_pod_builder_add(b, SPA_FORMAT_VIDEO_framerate, SPA_POD_Fraction(&framerates[0]), 0);
       }
 
-      if (format == SPA_VIDEO_FORMAT_xBGR_210LE) {
-        spa_pod_builder_add(b, SPA_FORMAT_VIDEO_colorPrimaries, SPA_POD_Id(SPA_VIDEO_COLOR_PRIMARIES_BT2020), 0);
-        spa_pod_builder_add(b, SPA_FORMAT_VIDEO_transferFunction, SPA_POD_Id(SPA_VIDEO_TRANSFER_SMPTE2084), 0);
-      }
 
       if (n_modifiers) {
         spa_pod_builder_prop(b, SPA_FORMAT_VIDEO_modifier, SPA_POD_PROP_FLAG_MANDATORY | SPA_POD_PROP_FLAG_DONT_FIXATE);
@@ -969,6 +965,15 @@ namespace pipewire {
       }
       if (spa_format_video_raw_parse(param, &d->format.info.raw) < 0) {
         return;
+      }
+
+      // KWin does not currently provide color metadata for screencast streams. Don't leave
+      // values from a previous stream in place; default to SDR when the compositor omits them.
+      if (!spa_pod_find_prop(param, nullptr, SPA_FORMAT_VIDEO_colorPrimaries)) {
+        d->format.info.raw.color_primaries = SPA_VIDEO_COLOR_PRIMARIES_BT709;
+      }
+      if (!spa_pod_find_prop(param, nullptr, SPA_FORMAT_VIDEO_transferFunction)) {
+        d->format.info.raw.transfer_function = SPA_VIDEO_TRANSFER_BT709;
       }
 
       BOOST_LOG(info) << "[pipewire] Video format: "sv << d->format.info.raw.format;
