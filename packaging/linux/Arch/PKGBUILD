@@ -6,6 +6,7 @@
 : "${_support_headless_testing:=false}"
 : "${_use_cuda:=detect}" # nvenc
 : "${_enable_pyrowave:=true}" # builds the bundled PyroWave (Vulkan wavelet) encoder; needs network access while building
+: "${_native_optimizations:=true}" # force -march=native -O3, ignoring the makepkg configuration; produces a CPU-specific package
 
 : "${_commit:=@GITHUB_COMMIT@}"
 
@@ -88,6 +89,10 @@ optdepends=(
 provides=()
 conflicts=()
 
+# LTO is the slowest build phase and measured neutral on the PyroWave path, so keep it off
+# regardless of the makepkg options.
+options=('!lto')
+
 source=("sunshine::git+file:///home/solidv/GitHub/Sunshine")
 sha256sums=('SKIP')
 
@@ -134,8 +139,16 @@ build() {
     export CC="gcc${_gcc_env_suffix}"
     export CXX="g++${_gcc_env_suffix}"
 
-    export CFLAGS="${CFLAGS/-Werror=format-security/}"
-    export CXXFLAGS="${CXXFLAGS/-Werror=format-security/}"
+    # Force native ISA tuning and -O3 so the result does not depend on the selected makepkg
+    # configuration. Appending is safe: the last -march/-O wins.
+    # Set _native_optimizations=false to build with the configured CFLAGS/CXXFLAGS instead.
+    if [[ "${_native_optimizations::1}" == "t" ]]; then
+      export CFLAGS="${CFLAGS/-Werror=format-security/} -march=native -O3"
+      export CXXFLAGS="${CXXFLAGS/-Werror=format-security/} -march=native -O3"
+    else
+      export CFLAGS="${CFLAGS/-Werror=format-security/}"
+      export CXXFLAGS="${CXXFLAGS/-Werror=format-security/}"
+    fi
 
     export MAKEFLAGS="${MAKEFLAGS:--j$(nproc)}"
 
