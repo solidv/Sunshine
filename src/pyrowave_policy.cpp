@@ -87,10 +87,14 @@ namespace pyrowave::policy {
     /**
      * @brief Record-size index used to find the earliest record that fits a shard remainder.
      *
-     * Records are bucketed by size in words (payload_words is a 12-bit field), each bucket holding
-     * its record indices in frame order. A min segment tree over the buckets keeps each bucket's
-     * earliest remaining index, so "earliest record of at most N words" is a prefix-minimum query.
-     * Records are only ever removed from the front of their bucket.
+     * Records are bucketed by size in words, each bucket holding its record indices in frame order.
+     * A min segment tree over the buckets keeps each bucket's earliest remaining index, so "earliest
+     * record of at most N words" is a prefix-minimum query. Records are only ever removed from the
+     * front of their bucket.
+     *
+     * Only the range of sizes the frame uses is bucketed. `payload_words` is a 12-bit field, so the
+     * absolute range is 0-4095, but a frame's records normally span a much narrower band and the
+     * counting sort below runs once per bucket.
      */
     class fit_index_t {
     public:
@@ -101,27 +105,41 @@ namespace pyrowave::policy {
        *
        * @param words One entry per record, in frame order.
        */
-      explicit fit_index_t(const std::vector<std::uint32_t> &words):
-          heads(LEAVES + 1, 0),
-          ends(LEAVES, 0),
-          order(words.size()),
-          tree(2 * LEAVES, NONE) {
+      explicit fit_index_t(const std::vector<std::uint32_t> &words) {
+        if (words.empty()) {
+          base_ = 0;
+          leaves_ = 1;
+        } else {
+          const auto range = std::minmax_element(words.begin(), words.end());
+          base_ = *range.first;
+          const auto span = std::size_t(*range.second) - base_ + 1;
+          leaves_ = 1;
+          while (leaves_ < span) {
+            leaves_ <<= 1;
+          }
+        }
+
+        heads.assign(leaves_ + 1, 0);
+        ends.assign(leaves_, 0);
+        order.resize(words.size());
+        tree.assign(2 * leaves_, NONE);
+
         // Counting sort of the record indices by size, stable in frame order.
         for (const auto w : words) {
-          ++heads[w + 1];
+          ++heads[index(w) + 1];
         }
-        for (std::size_t b = 0; b < LEAVES; ++b) {
+        for (std::size_t b = 0; b < leaves_; ++b) {
           heads[b + 1] += heads[b];
           ends[b] = heads[b + 1];
         }
         std::vector<std::size_t> fill(heads.begin(), heads.end() - 1);
         for (std::size_t i = 0; i < words.size(); ++i) {
-          order[fill[words[i]]++] = i;
+          order[fill[index(words[i])]++] = i;
         }
-        for (std::size_t b = 0; b < LEAVES; ++b) {
-          tree[LEAVES + b] = heads[b] < ends[b] ? order[heads[b]] : NONE;
+        for (std::size_t b = 0; b < leaves_; ++b) {
+          tree[leaves_ + b] = heads[b] < ends[b] ? order[heads[b]] : NONE;
         }
-        for (std::size_t n = LEAVES - 1; n > 0; --n) {
+        for (std::size_t n = leaves_ - 1; n > 0; --n) {
           tree[n] = std::min(tree[2 * n], tree[2 * n + 1]);
         }
       }
@@ -133,12 +151,12 @@ namespace pyrowave::policy {
        * @return Record index, or #NONE.
        */
       [[nodiscard]] std::size_t earliest_fitting(std::size_t max_words) const {
-        if (max_words == 0) {
+        if (max_words < base_) {
           return NONE;
         }
         std::size_t best = NONE;
-        std::size_t lo = LEAVES;
-        std::size_t hi = LEAVES + std::min(max_words, LEAVES - 1) + 1;
+        std::size_t lo = leaves_;
+        std::size_t hi = leaves_ + std::min(max_words - base_, leaves_ - 1) + 1;
         while (lo < hi) {
           if (lo & 1) {
             best = std::min(best, tree[lo++]);
@@ -159,7 +177,11 @@ namespace pyrowave::policy {
        * @return Record index, or #NONE.
        */
       [[nodiscard]] std::size_t earliest_exact(std::uint32_t words) const {
-        return words < LEAVES ? tree[LEAVES + words] : NONE;
+        if (words < base_) {
+          return NONE;
+        }
+        const auto bucket = std::size_t(words) - base_;
+        return bucket < leaves_ ? tree[leaves_ + bucket] : NONE;
       }
 
       /**
@@ -168,19 +190,31 @@ namespace pyrowave::policy {
        * @param words Record size in words.
        */
       void remove(std::uint32_t words) {
-        const auto head = ++heads[words];
-        std::size_t n = LEAVES + words;
-        tree[n] = head < ends[words] ? order[head] : NONE;
+        const auto bucket = index(words);
+        const auto head = ++heads[bucket];
+        std::size_t n = leaves_ + bucket;
+        tree[n] = head < ends[bucket] ? order[head] : NONE;
         for (n >>= 1; n > 0; n >>= 1) {
           tree[n] = std::min(tree[2 * n], tree[2 * n + 1]);
         }
       }
 
     private:
-      static constexpr std::size_t LEAVES = 4096;  ///< Size buckets plus the minimum-query slack.
+      /**
+       * @brief Bucket index of a record size in words.
+       *
+       * @param words Record size in words, at least #base_.
+       * @return Index into the bucket arrays.
+       */
+      [[nodiscard]] std::size_t index(std::uint32_t words) const {
+        return std::size_t(words) - base_;
+      }
 
-      std::vector<std::size_t> heads;  ///< Per size: position of the earliest remaining record in `order`.
-      std::vector<std::size_t> ends;  ///< Per size: end of its run in `order`.
+      std::uint32_t base_ = 0;  ///< Size in words of bucket 0.
+      std::size_t leaves_ = 1;  ///< Power-of-two bucket count covering the frame's size range.
+
+      std::vector<std::size_t> heads;  ///< Per bucket: position of the earliest remaining record in `order`.
+      std::vector<std::size_t> ends;  ///< Per bucket: end of its run in `order`.
       std::vector<std::size_t> order;  ///< Record indices grouped by size, in frame order.
       std::vector<std::size_t> tree;  ///< Min segment tree over the earliest remaining indices.
     };

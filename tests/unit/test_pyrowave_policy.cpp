@@ -267,6 +267,57 @@ TEST(PyroWaveRecordFrameTests, KeepsAllBlocksAndReportsCriticalBytes) {
   EXPECT_LT(stats->critical_bytes, out.size());
 }
 
+TEST(PyroWaveRecordFrameTests, HandlesIdenticalRecordSizes) {
+  // Every record is 20 bytes, so the packer's size index covers a single bucket.
+  const auto frame = make_two_level_frame(20, 12, {20, 20, 20});
+  std::vector<std::uint8_t> out;
+
+  const auto stats = pyrowave::policy::write_record_frame(frame, 32, out);
+  ASSERT_TRUE(stats.has_value());
+  ASSERT_FALSE(out.empty());
+
+  const auto info = pyrowave::policy::inspect_record_frame(out, 32);
+  ASSERT_TRUE(info.valid) << info.error;
+  EXPECT_EQ(info.block_records, 15u);
+  EXPECT_EQ(info.misaligned_records, 0u);
+  EXPECT_EQ(info.stripped, frame);
+}
+
+TEST(PyroWaveRecordFrameTests, HandlesRecordSizesFarFromZero) {
+  // Records of about 1 KB in 1376-byte shards: the size index must bucket a narrow band that starts
+  // well above zero instead of assuming every size from zero is present.
+  const auto frame = make_two_level_frame(1000, 12, {996, 1004, 1000});
+  std::vector<std::uint8_t> out;
+
+  const auto stats = pyrowave::policy::write_record_frame(frame, 1376, out);
+  ASSERT_TRUE(stats.has_value());
+  ASSERT_FALSE(out.empty());
+
+  const auto info = pyrowave::policy::inspect_record_frame(out, 1376);
+  ASSERT_TRUE(info.valid) << info.error;
+  EXPECT_EQ(info.block_records, 15u);
+  EXPECT_EQ(info.total_blocks, 15u);
+  EXPECT_EQ(info.misaligned_records, 0u);
+  EXPECT_EQ(info.stripped, frame);
+}
+
+TEST(PyroWaveRecordFrameTests, HandlesRecordsAcrossTheFullSizeField) {
+  // The largest record the 12-bit size field can describe next to an 8-byte one: the index spans the
+  // whole range, so the bucket count must not overflow.
+  const auto frame = make_two_level_frame(8, 12, {16380});
+  std::vector<std::uint8_t> out;
+
+  const auto stats = pyrowave::policy::write_record_frame(frame, 16396, out);
+  ASSERT_TRUE(stats.has_value());
+  ASSERT_FALSE(out.empty());
+
+  const auto info = pyrowave::policy::inspect_record_frame(out, 16396);
+  ASSERT_TRUE(info.valid) << info.error;
+  EXPECT_EQ(info.block_records, 13u);
+  EXPECT_EQ(info.misaligned_records, 0u);
+  EXPECT_EQ(info.stripped, frame);
+}
+
 TEST(PyroWaveRecordFrameTests, ReordersRecordsToFillShards) {
   // No coarse records (indices start at 12), so the fine group starts 24 bytes into a 40-byte
   // shard. The 20-byte record would leave 4 bytes, which is too small for padding, so the packer
