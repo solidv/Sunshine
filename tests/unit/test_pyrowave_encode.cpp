@@ -8,8 +8,10 @@
  * swizzle still streams, but with swapped or shifted colours.
  *
  * The encoder hands the buffer to PyroWave's scaler, so the wire values are the scaler's
- * conventions: full-range BT.709 YCbCr of the sRGB-encoded RGB, with neutral chroma at the
- * container depth's conventional code point (128/255 for R8, 512/1023 for R16).
+ * conventions: full-range BT.709 YCbCr of the sRGB-encoded RGB. Full range keeps neutral
+ * chroma at 0.5 normalized (the codec's DC shift and the client's CSC offset); limited
+ * range uses the client's H.273 16-bit code values. Both are independent of the plane
+ * container depth.
  *
  * They need a GPU with the Vulkan features PyroWave requires plus a GBM render node, and are
  * skipped otherwise (as in CI containers), matching how the other hardware-dependent tests behave.
@@ -336,7 +338,8 @@ namespace {
    *
    * @param fourcc DRM fourcc of the buffer to mint.
    * @param pixel Solid pixel value in the buffer's native representation.
-   * @param expected_y Expected decoded luma (full-range BT.709 on sRGB-encoded RGB).
+   * @param expected_y Expected decoded luma (BT.709 YCbCr of sRGB-encoded RGB, using the
+   *                   full-range or limited-range code values selected by @p full_range).
    * @param expected_cb Expected decoded Cb.
    * @param expected_cr Expected decoded Cr.
    * @param ten_bit True to encode into 10-bit (R16_UNORM) plane containers.
@@ -344,8 +347,10 @@ namespace {
    * modifier-less import path (imported as linear), while a real modifier takes that capture's
    * external image path.
    * @param full_range True to encode full-range YCbCr, false for limited (MPEG) range.
+   * @param luma_tolerance Allowed drift between the decoded 8-bit luma and @p expected_y.
+   * @param chroma_tolerance Allowed drift between the decoded 8-bit chroma and the expected value.
    */
-  void expect_solid_colour_round_trip(uint32_t fourcc, uint32_t pixel, uint8_t expected_y, uint8_t expected_cb, uint8_t expected_cr, bool ten_bit, uint64_t modifier = DRM_FORMAT_MOD_INVALID, bool full_range = true) {
+  void expect_solid_colour_round_trip(uint32_t fourcc, uint32_t pixel, uint8_t expected_y, uint8_t expected_cb, uint8_t expected_cr, bool ten_bit, uint64_t modifier = DRM_FORMAT_MOD_INVALID, bool full_range = true, int luma_tolerance = colour_tolerance, int chroma_tolerance = colour_tolerance) {
     if (!platf::pyrowave::validate()) {
       GTEST_SKIP() << "No PyroWave-capable Vulkan device";
     }
@@ -388,9 +393,9 @@ namespace {
 
     const int cx = image_width / 2;
     const int cy = image_height / 2;
-    EXPECT_NEAR(frame->luma_at(cx, cy), expected_y, colour_tolerance);
-    EXPECT_NEAR(frame->cb_at(cx, cy), expected_cb, colour_tolerance);
-    EXPECT_NEAR(frame->cr_at(cx, cy), expected_cr, colour_tolerance);
+    EXPECT_NEAR(frame->luma_at(cx, cy), expected_y, luma_tolerance);
+    EXPECT_NEAR(frame->cb_at(cx, cy), expected_cb, chroma_tolerance);
+    EXPECT_NEAR(frame->cr_at(cx, cy), expected_cr, chroma_tolerance);
 
     // Red and blue differ in which chroma axis is high, so a swapped R/B source mapping flips these.
     if (expected_cr > expected_cb) {
@@ -529,9 +534,16 @@ TEST(PyroWaveEncodeDmaBufTest, EncodesSolidBlueFrom8BitDmaBuf) {
 }
 
 TEST(PyroWaveEncodeDmaBufTest, EncodesLimitedRangeWhenNegotiated) {
-  // Limited (MPEG) range: sRGB white maps to Y=235 instead of 255, while neutral chroma stays at
-  // 128. This is the range a client on the usual "standard" HDMI setting negotiates.
-  expect_solid_colour_round_trip(DRM_FORMAT_ARGB8888, 0xffffffffu, 235, 128, 128, false, DRM_FORMAT_MOD_INVALID, false);
+  // Limited (MPEG) range uses the client's 16-bit H.273 code values: 16..235 luma and 16..240
+  // chroma shifted up by 8 for the R16 plane containers. This is the range a client on the usual
+  // "standard" HDMI setting negotiates. Read back at 8 bits, white is 60160/65535 * 255 ~= 234;
+  // the client's CSC expands it to 255. The tight tolerance catches a return to 8-bit codes.
+  expect_solid_colour_round_trip(DRM_FORMAT_ARGB8888, 0xffffffffu, 234, 128, 128, false, DRM_FORMAT_MOD_INVALID, false, 0, 1);
+}
+
+TEST(PyroWaveEncodeDmaBufTest, EncodesTenBitLimitedRangeWhenNegotiated) {
+  // The same 16-bit code convention in the 10-bit (R16_UNORM) container.
+  expect_solid_colour_round_trip(DRM_FORMAT_XRGB2101010, 0x3fffffffu, 234, 128, 128, true, DRM_FORMAT_MOD_INVALID, false, 0, 1);
 }
 
 TEST(PyroWaveEncodeDmaBufTest, EncodesSolidRedFrom8BitXbgrDmaBuf) {

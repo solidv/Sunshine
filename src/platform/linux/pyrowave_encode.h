@@ -186,7 +186,8 @@ namespace platf::pyrowave {
      *            and an HDR display; else SDR BT.709 is used).
      * @param full_range True to encode full-range YCbCr, false for limited (MPEG) range. The
      *                   scaler's RGB->YUV conversion uses this, matching the client's negotiated
-     *                   color range.
+     *                   color range. Limited range uses H.273 16-bit code values (PyroWave
+     *                   permits 8..16), matching the client's 16-bit CSC.
      * @param packet_size Negotiated maximum packet payload (`x-nv-video[0].packetSize`), used to
      *                    size the transport chunk boundary; 0 keeps the default.
      * @param record_framing True to emit record framing, which PyroWave-aware clients parse with
