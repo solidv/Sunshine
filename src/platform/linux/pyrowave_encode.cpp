@@ -1469,19 +1469,12 @@ namespace platf::pyrowave {
       info.input_color_space = hdr ? VK_COLOR_SPACE_HDR10_ST2084_EXT : VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
       info.output_color_space = info.input_color_space;
       info.ycbcr_range = full_range ? VK_SAMPLER_YCBCR_RANGE_ITU_FULL : VK_SAMPLER_YCBCR_RANGE_ITU_NARROW;
-      // PyroWave's bitstream is floating-point and leaves the final UNORM code depth to external
-      // signaling (pyrowave.h, bitstream/bitstream.md); the client's 16-bit CSC is that signal.
-      // Its limited-range expansion expects H.273 16-bit codes (16..235 luma and 16..240 chroma
-      // shifted up by 8). Using the stream's 8- or 10-bit codes here leaves a constant gain error
-      // in every limited-range frame. Full range ignores the bit depth.
-      info.ycbcr_range_bit_depth = 16;
+      info.ycbcr_range_bit_depth = ten_bit ? 10 : 8;
       // PyroWave is depth-agnostic (normalized-float wavelet); the plane container depth just has
       // to match what the client decodes into.
       info.intermediate_plane_format = ten_bit ? VK_FORMAT_R16_UNORM : VK_FORMAT_R8_UNORM;
-      // 0.5 is PyroWave's bit-depth-agnostic neutral chroma (pyrowave.h), and it is what the
-      // client's 16-bit CSC expects. The BT code-value midpoint (128/255 or 512/1023) would
-      // leave a constant chroma bias that tints neutral whites.
-      info.ycbcr_chroma_midpoint = 0.5f;
+      // Neutral chroma code point for the container depth (the codec itself is float).
+      info.ycbcr_chroma_midpoint = ten_bit ? 512.0f / 1023.0f : 128.0f / 255.0f;
       info.force_linear_filtering = false;
       info.skip_dither = false;
 
