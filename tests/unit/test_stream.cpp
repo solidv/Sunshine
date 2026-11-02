@@ -35,7 +35,20 @@ namespace stream {
   int fec_percent_for_codec(bool is_pyrowave, int fec_percent, int pyrowave_critical_fec_percentage);
   std::uint16_t pyrowave_critical_packet_count(size_t head_stream_bytes, size_t payload_blocksize, size_t total_shards);
   size_t pyrowave_shard_count(size_t payload_bytes, size_t blocksize);
+  bool test_receive_ping_endpoints(bool session_id_pings);
 }  // namespace stream
+
+TEST(StreamPingTests, KeepsLegacyAudioAndVideoSenderEndpointsSeparate) {
+  for (int attempt = 0; attempt < 20; ++attempt) {
+    ASSERT_TRUE(stream::test_receive_ping_endpoints(false)) << "Attempt " << attempt;
+  }
+}
+
+TEST(StreamPingTests, KeepsSessionIdAudioAndVideoSenderEndpointsSeparate) {
+  for (int attempt = 0; attempt < 20; ++attempt) {
+    ASSERT_TRUE(stream::test_receive_ping_endpoints(true)) << "Attempt " << attempt;
+  }
+}
 
 TEST(ConcatAndInsertTests, ConcatNoInsertionTest) {
   std::array<char, 2> b1 = {'a', 'b'};
