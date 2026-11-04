@@ -819,6 +819,24 @@ namespace stream {
 
   namespace fec {
     /**
+     * @brief Limit data shards so data and parity fit in an 8-bit Reed-Solomon block.
+     *
+     * @param percentage Recovery-shard percentage between 0 and 100.
+     * @return Maximum data shards with room for the requested parity shards.
+     */
+    int max_data_shards(int percentage) {
+      // The 8-bit Reed-Solomon encoder allows 255 data and parity shards combined.
+      // The max number of data shards per block is found by solving this system of equations for D:
+      // D = 255 - P
+      // P = D * F
+      // which results in the solution:
+      // D = 255 / (1 + F)
+      // multiplied by 100 since F is the percentage as an integer:
+      // D = (255 * 100) / (100 + F)
+      return (RS8_DATA_SHARDS_MAX * 100) / (100 + percentage);
+    }
+
+    /**
      * @brief Owning pointer for a Reed-Solomon encoder instance.
      */
     using rs_t = util::safe_ptr<reed_solomon, [](reed_solomon *rs) {
@@ -1019,7 +1037,7 @@ namespace stream {
     }
 
     // The protected block must fit data + parity in the Reed-Solomon shard limit.
-    if (head_packets > (size_t) (DATA_SHARDS_MAX * 100) / (100 + head_fec_percentage)) {
+    if (head_packets > (size_t) fec::max_data_shards(head_fec_percentage)) {
       fallback = fec_split_fallback_e::head_shard_limit;
       return 0;
     }
@@ -1027,7 +1045,7 @@ namespace stream {
     // Bare blocks never run Reed-Solomon, but stay within the shard limit anyway so every field
     // and client-side assumption sees values the even split could have produced.
     const size_t tail_packets = total_packets - head_packets;
-    const int tail_blocks = (int) ((tail_packets + DATA_SHARDS_MAX - 1) / DATA_SHARDS_MAX);
+    const int tail_blocks = (int) ((tail_packets + RS8_DATA_SHARDS_MAX - 1) / RS8_DATA_SHARDS_MAX);
     if (1 + tail_blocks > MAX_FEC_BLOCKS) {
       fallback = fec_split_fallback_e::tail_block_limit;
       return 0;
@@ -1905,21 +1923,14 @@ namespace stream {
         // report the limit once instead of once per frame.
         session->video.logged_fec_split_fallback = true;
         if (split_fallback == fec_split_fallback_e::head_shard_limit) {
-          BOOST_LOG(warning) << "FEC head protection skipped: the loss-critical head exceeds the "sv << (DATA_SHARDS_MAX * 100) / (100 + critical_fec_percentage) << "-packet limit for "sv << critical_fec_percentage << "% parity; the frame will use the configured "sv << fecPercentage << "% FEC"sv;
+          BOOST_LOG(warning) << "FEC head protection skipped: the loss-critical head exceeds the "sv << fec::max_data_shards(critical_fec_percentage) << "-packet limit for "sv << critical_fec_percentage << "% parity; the frame will use the configured "sv << fecPercentage << "% FEC"sv;
         } else {
           BOOST_LOG(warning) << "FEC head protection skipped: the bare tail exceeds "sv << (MAX_FEC_BLOCKS - 1) << " FEC blocks; the frame will use the configured "sv << fecPercentage << "% FEC"sv;
         }
       }
 
       if (fec_blocks_needed == 0) {
-        // The max number of data shards per block is found by solving this system of equations for D:
-        // D = 255 - P
-        // P = D * F
-        // which results in the solution:
-        // D = 255 / (1 + F)
-        // multiplied by 100 since F is the percentage as an integer:
-        // D = (255 * 100) / (100 + F)
-        auto max_data_shards_per_fec_block = (DATA_SHARDS_MAX * 100) / (100 + fecPercentage);
+        auto max_data_shards_per_fec_block = fec::max_data_shards(fecPercentage);
 
         // Compute the number of FEC blocks needed for this frame using the block size and max shards
         auto max_data_per_fec_block = max_data_shards_per_fec_block * blocksize;
